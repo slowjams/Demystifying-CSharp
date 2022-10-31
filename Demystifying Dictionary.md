@@ -123,7 +123,7 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
       if (buckets != null) {
          int hashCode = comparer.GetHashCode(key) & 0x7FFFFFFF;
          for (int i = buckets[hashCode % buckets.Length]; i >= 0; i = entries[i].next) {
-            if (entries[i].hashCode == hashCode && comparer.Equals(entries[i].key, key)) return i;
+            if (entries[i].hashCode == hashCode && comparer.Equals(entries[i].key, key)) return i;  // <--------------------------
          }
       }
       return -1;
@@ -358,8 +358,9 @@ Now you see why in (1) when `freeCount` is already 0, why we still need to check
   <li>Dictionary's internal data structure that stores items is array, just like <code>List<T></code></li>
   <li><b>TKey and TValue are saved together in the struct <code>Entry</code></b> I originally though only TValue is saved, TKey is not saved. But you need to know the reason TKey is saved in the struct with TValue together is: TKey will be used <code>IEqualityComparer</code> to check whether two keys are the same or not as the last effort, note that saved hash code will be used first as a quick way to determine equality of two keys.</li>
   <li><b>Buckets is just in integer array</b> Not array of pointers that each element points to a sub memory</li>
-  <li><b>Access TValue using <code>this[TKey key]</code> indexer when TKey is not valid will throw an exception</b> If you don't want an exception to be thrown, use <code>TryGetValue(TKey key, out TValue value)</code></li>
+  <li><b>Access(get, not set) TValue using <code>this[TKey key]</code> indexer when TKey is not valid will throw an exception</b> If you don't want an exception to be thrown, use <code>TryGetValue(TKey key, out TValue value)</code></li>
   <li><b>hashCode in Entry is used to tell if the current element is part of freeList</b> You see <code>entries[i].hashCode >= 0</code> used in many places. For example, hashCode is checked in TKey, TValue, Dictionary's Enumerators to only add active elements</li>
+  <li>Call Add with an existing TKey throws an exception, however, using index to set is fine</li>
 </ul> 
 
 <div class="alert alert-info p-1" role="alert">

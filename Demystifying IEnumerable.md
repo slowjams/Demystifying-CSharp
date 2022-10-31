@@ -478,7 +478,8 @@ public class List<T> : IList<T>, IList, IReadOnlyList<T> {
       return new Enumerator(this);
    }
 
-   public struct Enumerator : IEnumerator<T>, System.Collections.IEnumerator {  
+   public struct Enumerator : IEnumerator<T>, IEnumerator 
+   {  
       private List<T> list;
       private int index;
       private T current;
