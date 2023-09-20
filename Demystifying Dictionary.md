@@ -114,7 +114,8 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
 
    private int Initialize(int capacity)
    {
-      int size = HashHelpers.GetPrime(capacity);
+      int size = HashHelpers.GetPrime(capacity);  // pick up a prime number from 3, 7, 11, 17, 23, 29, 37, 47, 59, 71 which is the first one greater than capacity
+                                                  // when you don't specify capacity when you construct a dictionary, the initial size is 3
       int[] buckets = new int[size];
       Entry[] entries = new Entry[size];
 
@@ -124,7 +125,7 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
  
       return size;
    }
-   
+
    /*
    public struct KeyValuePair<TKey, TValue> {
       private TKey key;
@@ -264,7 +265,7 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
 	   } 
 	   else {
 		  // There are two kinds of "holes", first kind is the one was used before but then removed, second kind is the ones hasn't been used 
-		  if (count == entries.Length) {  <------------------------------------------------------------- (1)                               
+		  if (count == entries.Length) {  //<-------------------------------------------------------------1                              
 			 Resize();  // resize the entry[] and copy the existing array to the new array, and recalculate and reassign hash code to existing element
 			 targetBucket = hashCode % buckets.Length;  // this is needed because the buckets.Length will change due to the Resize() method
 		  }
