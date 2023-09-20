@@ -123,10 +123,12 @@ The complete code is:
 static void Main(string[] args) {
     var list = new MyList() { "Hello", "World" };
 
+    // the implementation for `foreach`
     var enumerator = list.GetEnumerator();
     while (enumerator.MoveNext()) {
         Console.WriteLine(enumerator.Current);
     }
+    //
 
     enumerator.Reset();             //reset the index so that the list can be iterated again
 
@@ -169,7 +171,7 @@ public class MyList : IEnumerable {
     }
 
     private class ListEnumerator : IEnumerator {
-        private int _currentIndex = -1;
+        private int _currentIndex = -1;  // this is important, index starts with an invalid value, so you have to call MoveNext() first 
         private MyList list;
 
         public ListEnumerator(MyList list) {
@@ -614,16 +616,3 @@ public class MyClass_Enumerator : IEnumerable<int>
    }
 }
 ```
-
-<style type="text/css">
-.markdown-body {
-  max-width: 1800px;
-  margin-left: auto;
-  margin-right: auto;
-}
-</style>
-
-<link rel="stylesheet" href="./zCSS/bootstrap.min.css">
-<script src="./zCSS/jquery-3.3.1.slim.min.js"></script>
-<script src="./zCSS/popper.min.js"></script>
-<script src="./zCSS/bootstrap.min.js"></script>

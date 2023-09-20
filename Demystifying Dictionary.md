@@ -354,18 +354,19 @@ Now you see why in (1) when `freeCount` is already 0, why we still need to check
 
 ## Some Observations
 
-<ul>
-  <li>Dictionary's internal data structure that stores items is array, just like <code>List<T></code></li>
-  <li><b>TKey and TValue are saved together in the struct <code>Entry</code></b> I originally though only TValue is saved, TKey is not saved. But you need to know the reason TKey is saved in the struct with TValue together is: TKey will be used <code>IEqualityComparer</code> to check whether two keys are the same or not as the last effort, note that saved hash code will be used first as a quick way to determine equality of two keys.</li>
-  <li><b>Buckets is just in integer array</b> Not array of pointers that each element points to a sub memory</li>
-  <li><b>Access(get, not set) TValue using <code>this[TKey key]</code> indexer when TKey is not valid will throw an exception</b> If you don't want an exception to be thrown, use <code>TryGetValue(TKey key, out TValue value)</code></li>
-  <li><b>hashCode in Entry is used to tell if the current element is part of freeList</b> You see <code>entries[i].hashCode >= 0</code> used in many places. For example, hashCode is checked in TKey, TValue, Dictionary's Enumerators to only add active elements</li>
-  <li>Call Add with an existing TKey throws an exception, however, using index to set is fine</li>
-</ul> 
+* Dictionary's internal data structure that stores items is array, just like `List<T>`
 
-<div class="alert alert-info p-1" role="alert">
-    Based on the source code, you will see using indexer to change TValue for existing TKey is OK, it will override the existing TValue (<code>Entry</code> struct, to be precisely). But a duplicated key exception will be thrown if using Add method to add an element when the key already exists in the dictionary.
-</div>
+* TKey and TValue are saved together in the struct `Entry`. I originally though only TValue is saved, TKey is not saved. But you need to know the reason TKey is saved in the struct with TValue together is: TKey will be used `IEqualityComparer` to check whether two keys are the same or not as the last effort, note that saved hash code will be used first as a quick way to determine equality of two keys.
+
+* Buckets is just in integer array, Not array of pointers that each element points to a sub memory
+
+* Access(get, not set) TValue using this `[TKey key]` indexer when TKey is not valid will throw an exception. If you don't want an exception to be thrown, use `TryGetValue(TKey key, out TValue value)`
+
+* hashCode in Entry is used to tell if the current element is part of freeList. You see `entries[i].hashCode >= 0` used in many places. For example, hashCode is checked in TKey, TValue, Dictionary's Enumerators to only add active elements
+
+* Call Add with an existing TKey throws an exception, however, using index to set is fine
+
+Based on the source code, you will see using indexer to change TValue for existing TKey is OK, it will override the existing TValue (`Entry` struct, to be precisely). But a duplicated key exception will be thrown if using Add method to add an element when the key already exists in the dictionary.
 
 ## TKey-Reference Types
 
