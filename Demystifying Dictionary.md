@@ -76,11 +76,32 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
    private ValueCollection values;
 
    public Dictionary(): this(0, null) {}
-   public Dictionary(int capacity): this(capacity, null) {}   // capacity: The initial number of elements that the dictionary can contains
-   public Dictionary(IEqualityComparer<TKey> comparer): this(0, comparer) {}
-   public Dictionary(int capacity, IEqualityComparer<TKey> comparer) {
-      ...
-      this.comparer = comparer ?? EqualityComparer<TKey>.Default;
+
+   public Dictionary(int capacity): this(capacity, null) { }   // capacity: The initial number of elements that the dictionary can contains
+
+   public Dictionary(IEqualityComparer<TKey> comparer): this(0, comparer) { }
+
+   public Dictionary(int capacity, IEqualityComparer<TKey> comparer) 
+   {
+      if (capacity < 0)
+         ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.capacity);
+ 
+      if (capacity > 0)
+         Initialize(capacity);
+ 
+      if (!typeof(TKey).IsValueType)
+      {
+         _comparer = comparer ?? EqualityComparer<TKey>.Default;
+ 
+         if (typeof(TKey) == typeof(string) && NonRandomizedStringEqualityComparer.GetStringComparer(_comparer!) is IEqualityComparer<string> stringComparer)
+         {
+             _comparer = (IEqualityComparer<TKey>)stringComparer;
+         }
+      }
+      else if (comparer is not null && comparer != EqualityComparer<TKey>.Default)
+      {
+         _comparer = comparer;
+      }
    }
 
    public Dictionary(IDictionary<TKey,TValue> dictionary, IEqualityComparer<TKey> comparer): this(dictionary != null? dictionary.Count: 0, comparer) {
@@ -90,6 +111,20 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
          Insert(key, value, true);
       }
    }
+
+   private int Initialize(int capacity)
+   {
+      int size = HashHelpers.GetPrime(capacity);
+      int[] buckets = new int[size];
+      Entry[] entries = new Entry[size];
+
+      _freeList = -1;
+      _buckets = buckets;
+      _entries = entries;
+ 
+      return size;
+   }
+   
    /*
    public struct KeyValuePair<TKey, TValue> {
       private TKey key;
@@ -97,7 +132,7 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
       ...// a constructor, getter, setter for key, value
    }
    */
-   ...
+   // ...
    public int Count { 
       get { return count - freeCount; }  // This is important to know the underlying structure
    }
@@ -247,6 +282,41 @@ public class Dictionary<TKey,TValue>: IDictionary<TKey,TValue>, IDictionary, IEn
 	   buckets[targetBucket] = index; // The bucket will point to the newly added entry from now on.
 	}  
     
+   private void Resize(int newSize, bool forceNewHashCodes = false)
+   {
+      Entry[] entries = new Entry[newSize];
+ 
+      int count = _count;
+      Array.Copy(_entries, entries, count);
+ 
+      if (!typeof(TKey).IsValueType && forceNewHashCodes)
+      {
+         IEqualityComparer<TKey> comparer = _comparer = (IEqualityComparer<TKey>)((NonRandomizedStringEqualityComparer)_comparer).GetRandomizedEqualityComparer();
+ 
+         for (int i = 0; i < count; i++)
+         {
+            if (entries[i].next >= -1)
+            {
+               entries[i].hashCode = (uint)comparer.GetHashCode(entries[i].key);
+            }
+         }
+      }
+
+      _buckets = new int[newSize];
+
+      for (int i = 0; i < count; i++)
+      {
+         if (entries[i].next >= -1)
+         {
+            ref int bucket = ref GetBucket(entries[i].hashCode);
+            entries[i].next = bucket - 1; // Value in _buckets is 1-based
+            bucket = i + 1;
+         }
+      }
+ 
+      _entries = entries;
+   }
+
    public void Clear() {   // Removes all keys and values
       if (count > 0) {
          for (int i = 0; i < buckets.Length; i++) 
