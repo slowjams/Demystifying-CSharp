@@ -1902,43 +1902,6 @@ public class ControllerActionInvoker : IActionInvoker
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 compare endpoints.MapControllers() and endpoints.MapDefaultControllerRoute() to see if MapControllers() is still needed when using MapDefaultControllerRoute()
 
 
@@ -1952,16 +1915,3 @@ Now whenever you run your application and try to access a view then what the Raz
 how does output get generated
 how does ActionContext get created
 how IActionResult get rendered, combined with previous restful web api chapter
-
-<style type="text/css">
-.markdown-body {
-  max-width: 1800px;
-  margin-left: auto;
-  margin-right: auto;
-}
-</style>
-
-<link rel="stylesheet" href="./zCSS/bootstrap.min.css">
-<script src="./zCSS/jquery-3.3.1.slim.min.js"></script>
-<script src="./zCSS/popper.min.js"></script>
-<script src="./zCSS/bootstrap.min.js"></script>

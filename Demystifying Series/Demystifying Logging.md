@@ -13,7 +13,7 @@ Demystifying Logging
       "FormatterName": "json",
       "FormatterOptions": {
         "SingleLine": true,
-        "IncludeScopes": true,
+        "IncludeScopes": true,  // 
         "TimestampFormat": "HH:mm:ss ",
         "UseUtcTimestamp": true,
         "JsonWriterOptions": {
@@ -24,7 +24,6 @@ Demystifying Logging
     }
   }
 }
-
 ```
 
 Instrumentation is code that is added to a software project to record what it is doing. This information can then be collected in files, databases, or in-memory and analyzed to understand how a software program is operating.
@@ -40,6 +39,14 @@ public class HomeController : Controller
    public HomeController(ILogger<HomeController> logger)
    {
       _logger = logger;
+     
+   }
+
+   public HomeController(ILoggerFactory factory)
+   {
+       // Unless you're using heavily customized categories for some reason, favor injecting ILogger<T> over ILoggerFactory 
+       _logger = factory.CreateLogger("DemystifyingLogging.NotCalledHomeController");  // for heavily customized categories
+       //_logger = factory.CreateLogger<HomeController>(); // same as inject ILogger<HomeController>
    }
 
    public IActionResult Index()
@@ -95,6 +102,7 @@ Trace.AutoFlush = true;
 ```
 
 ```C#
+//------------------V
 public class Program {
    public static void Main(string[] args) {
       CreateHostBuilder(args).Build().Run();
@@ -112,18 +120,19 @@ public class Program {
                  {   
                     options.IncludeScopes = true;
                  }
-               ).AddFilter("Boc.Domain", LogLevel.Debug);  // you can also configure the logging category/level via code
+               ).AddFilter("Boc.Domain", LogLevel.Debug);  // you can also configure the logging category/level via code, not just from appsetting.json
            });
 }
+//------------------Ʌ
 
-// example
-public class MyService {
+//-------------------------V example
+public class HomeController {
 
-   public MyService(ILogger<MyService> logger) {  // <------------------------4_
+   public HomeController(ILogger<MyService> logger) {  // <------------------------4_
       // ...
    }
    
-   public void Add()
+   public void MethodToBeCalled()
    {
       _logger.LogTrace("Loaded Trace");
       _logger.LogDebug("Loaded Debug");
@@ -133,9 +142,7 @@ public class MyService {
       _logger.LogError("Loaded Error");
       _logger.LogCritical("Loaded Critical");
       
-      //----------------------------------------------
-      _logger.LogWarning("No, I don't have scope");
-
+      //-------------------------------------->>
       using(_logger.BeginScope("Scope value"))
       using(_logger.BeginScope(new Dictionary<string, object> { { "CustomValue1", 12345 } }))
       {
@@ -144,12 +151,27 @@ public class MyService {
       }
 
       _logger.LogWarning("No, I lost it again");
+      //--------------------------------------<< logging output as below
+      /* you have to set IncludeScopes to true to be able to log and see ConnectionId, SpanId, TraceId, ParentId etc
+      warn: DemystifyingLogging.Controllers.HomeController[0]
+            => ConnectionId:0HN1LUP1092ME => RequestPath:/ RequestId:0HN1LUP1092ME:00000001, SpanId:|8909bd52-4f55d689b02d8489., TraceId:8909bd52-4f55d689b02d8489, ParentId: => DemystifyingLogging.Controllers.HomeController.Index (DemystifyingLogging) => Scope value => System.Collections.Generic.Dictionary`2[System.String,System.Object]
+            
+            Yes, I have the scope!
+      warn: DemystifyingLogging.Controllers.HomeController[0]
+            => ConnectionId:0HN1LUP1092ME => RequestPath:/ RequestId:0HN1LUP1092ME:00000001, SpanId:|8909bd52-4f55d689b02d8489., TraceId:8909bd52-4f55d689b02d8489, ParentId: => 
+            DemystifyingLogging.Controllers.HomeController.Index (DemystifyingLogging) => Scope value => System.Collections.Generic.Dictionary`2[System.String,System.Object]
+            
+            again, I have the scope!
+      warn: DemystifyingLogging.Controllers.HomeController[0]
+            => ConnectionId:0HN1LUP1092ME => RequestPath:/ RequestId:0HN1LUP1092ME:00000001, SpanId:|8909bd52-4f55d689b02d8489., TraceId:8909bd52-4f55d689b02d8489, ParentId: => DemystifyingLogging.Controllers.HomeController.Index (DemystifyingLogging)
+            
+            No, I lost it again
+*/
    }
 }
+//-------------------------Ʌ 
 
 // example
-namespace Boc.Data;
-
 public class EmployeeRepository : IEmployeeRepository
 {
    private readonly ILogger<EmployeeRepository> _logger;
@@ -163,28 +185,6 @@ public class EmployeeRepository : IEmployeeRepository
    }
 }
 
-
-// example
-public class CookiePolicyMiddleware {
-   private readonly RequestDelegate _next;
-   private readonly ILogger _logger;
-                                                      
-   public CookiePolicyMiddleware(RequestDelegate next, IOptions<CookiePolicyOptions> options, ILoggerFactory factory) {
-      // ...
-      _next = next;
-      _logger = factory.CreateLogger<CookiePolicyMiddleware>();
-   }
-
-   public Task Invoke(HttpContext context) 
-   {
-      var feature = context.Features.Get<IResponseCookiesFeature>() ?? new ResponseCookiesFeature(context.Features) 
-      var wrapper = new ResponseCookiesWrapper(context, Options, feature, _logger);
-      context.Features.Set<IResponseCookiesFeature>(new CookiesWrapperFeature(wrapper));
-      context.Features.Set<ITrackingConsentFeature>(wrapper);
-
-      return _next(context);
-   }
-}
 ```
 
 Quick dependencies simplified code:
@@ -204,7 +204,7 @@ public interface ILogger
 //---------------------------------------------------<<
 
 //---------------------------------V
-public class Logger<T> : ILogger<T>  // so inject `Logger<T>` is just an indirect call of injecting `ILoggerFactory`
+public class Logger<T> : ILogger<T>  // <-----------------------------so inject `Logger<T>` is just an indirect call of injecting `ILoggerFactory`
 {
    private readonly ILogger _logger;
 
@@ -272,7 +272,7 @@ internal readonly struct LoggerInformation  // has dependency of ILoggerProvider
    public LoggerInformation(ILoggerProvider provider, string category) : this()
    {
       ProviderType = provider.GetType();
-      Logger = provider.CreateLogger(category);  // <--------------use ILoggerProvider to create an ILogger
+      Logger = provider.CreateLogger(category);  // <--------------use ILoggerProvider to create an ILogger, e.g ConsoleLoggerProvider which calls `new ConsoleLogger(...)`
       Category = category;
    }
  
@@ -314,6 +314,9 @@ internal sealed class Logger : ILogger   // Logger is a wrapper so it contains m
 }
 //--------------------------Ʌ
 ```
+
+
+=========================================================================================================================================
 
 
 ## Source Code
@@ -371,8 +374,37 @@ public static class LoggingBuilderExtensions
 }
 //------------------------------------------Ʌ
 
-//-----------------------------------------V
-public static class ConsoleLoggerExtensions
+//-------------------------------------------------V
+public static partial class ConsoleLoggerExtensions
+{
+    public static ILoggingBuilder AddConsole(this ILoggingBuilder builder)
+    {
+        builder.AddConfiguration();
+ 
+        builder.AddConsoleFormatter<JsonConsoleFormatter, JsonConsoleFormatterOptions, ConsoleFormatterConfigureOptions>();
+        builder.AddConsoleFormatter<SystemdConsoleFormatter, ConsoleFormatterOptions, ConsoleFormatterConfigureOptions>();
+        builder.AddConsoleFormatter<SimpleConsoleFormatter, SimpleConsoleFormatterOptions, ConsoleFormatterConfigureOptions>();
+ 
+        builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<ILoggerProvider, ConsoleLoggerProvider>());
+ 
+        builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<IConfigureOptions<ConsoleLoggerOptions>, ConsoleLoggerConfigureOptions>());
+        builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<IOptionsChangeTokenSource<ConsoleLoggerOptions>, LoggerProviderOptionsChangeTokenSource<ConsoleLoggerOptions, ConsoleLoggerProvider>>());
+ 
+        return builder;
+    }
+
+    public static ILoggingBuilder AddConsole(this ILoggingBuilder builder, Action<ConsoleLoggerOptions> configure)
+    { 
+        builder.AddConsole();
+        builder.Services.Configure(configure);
+ 
+        return builder;
+    }
+}
+//-------------------------------------------------Ʌ
+
+//-------------------------------------------------V
+public static partial class ConsoleLoggerExtensions
 {
    public static ILoggingBuilder AddConsole(this ILoggingBuilder builder, Action<ConsoleLoggerOptions> configure)  // <----------------------------2
    {
@@ -450,7 +482,7 @@ public static class ConsoleLoggerExtensions
       return builder;
    }
 }
-//-----------------------------------------Ʌ
+//-------------------------------------------------Ʌ
 
 //----------------------------------------------V
 public static class DebugLoggerFactoryExtensions
@@ -867,15 +899,107 @@ internal sealed class NullExternalScopeProvider : IExternalScopeProvider
 }
 //---------------------------------------------Ʌ
 
-/*  very complicated
+//-------------------------------------V
+public interface IExternalScopeProvider
+{
+   void ForEachScope<TState>(Action<object?, TState> callback, TState state);
+   IDisposable Push(object? state);
+}
+//-------------------------------------Ʌ
+
+//----------------------------------------------V
 internal sealed class LoggerFactoryScopeProvider : IExternalScopeProvider
 {
-   private readonly AsyncLocal<Scope?> _currentScope = new AsyncLocal<Scope?>();
-   private readonly ActivityTrackingOptions _activityTrackingOption;
+    private readonly AsyncLocal<Scope?> _currentScope = new AsyncLocal<Scope?>();
+    private readonly ActivityTrackingOptions _activityTrackingOption;
 
+    public LoggerFactoryScopeProvider(ActivityTrackingOptions activityTrackingOption) => _activityTrackingOption = activityTrackingOption;
 
+    public IDisposable Push(object? state)
+    {
+        Scope? parent = _currentScope.Value;
+        var newScope = new Scope(this, state, parent);
+        _currentScope.Value = newScope;
+ 
+        return newScope;
+    }
+
+    private sealed class Scope : IDisposable
+    {
+        private readonly LoggerFactoryScopeProvider _provider;
+        private bool _isDisposed;
+ 
+        internal Scope(LoggerFactoryScopeProvider provider, object? state, Scope? parent)
+        {
+            _provider = provider;
+            State = state;
+            Parent = parent;
+        }
+ 
+        public Scope? Parent { get; }
+ 
+        public object? State { get; }
+ 
+        public override string? ToString()
+        {
+                return State?.ToString();
+        }
+ 
+        public void Dispose()  // <-----------------------no need to understand, just get the idea that need to call Dispose on Scope
+        {
+            if (!_isDisposed)
+            {
+                _provider._currentScope.Value = Parent;
+                _isDisposed = true;
+            }
+        }
+    }
+
+    public void ForEachScope<TState>(Action<object?, TState> callback, TState state)
+    {
+        // ...
+        if (_activityTrackingOption != ActivityTrackingOptions.None)
+        {
+            Activity? activity = Activity.Current;
+            if (activity != null)
+            {
+                const string propertyKey = "__ActivityLogScope__";
+ 
+                ActivityLogScope? activityLogScope = activity.GetCustomProperty(propertyKey) as ActivityLogScope;
+                if (activityLogScope == null)
+                {
+                    activityLogScope = new ActivityLogScope(activity, _activityTrackingOption);
+                    activity.SetCustomProperty(propertyKey, activityLogScope);
+                }
+ 
+                callback(activityLogScope, state);
+ 
+                // Tags and baggage are opt-in and thus we assume that most of the time it will not be used.
+                if ((_activityTrackingOption & ActivityTrackingOptions.Tags) != 0 && activity.TagObjects.GetEnumerator().MoveNext())
+                {
+                    // As TagObjects is a IEnumerable<KeyValuePair<string, object?>> this can be used directly as a scope.
+                    // We do this to safe the allocation of a wrapper object.
+                    callback(activity.TagObjects, state);
+                }
+ 
+                if ((_activityTrackingOption & ActivityTrackingOptions.Baggage) != 0)
+                {
+                    // Only access activity.Baggage as every call leads to an allocation
+                    IEnumerable<KeyValuePair<string, string?>> baggage = activity.Baggage;
+                    if (baggage.GetEnumerator().MoveNext())
+                    {
+                        // For the baggage a wrapper object is necessary because we need to be able to overwrite ToString().
+                        // In contrast to the TagsObject, Baggage doesn't have one underlining type where we can do this overwrite.
+                        ActivityBaggageLogScopeWrapper scope = GetOrCreateActivityBaggageLogScopeWrapper(activity, baggage);
+                        callback(scope, state);
+                    }
+                }
+            }
+        }
+        // ...
+    }
 }
-*/
+//----------------------------------------------Ʌ
 
 //-------------------------------------V
 public readonly struct LogEntry<TState>
@@ -912,6 +1036,125 @@ public abstract class ConsoleFormatter
    public abstract void Write<TState>(in LogEntry<TState> logEntry, IExternalScopeProvider? scopeProvider, TextWriter textWriter);
 }
 //------------------------------------Ʌ
+
+//------------------------------------------V this is the default formatter being used when calling AddLogging()
+internal sealed class SimpleConsoleFormatter : ConsoleFormatter, IDisposable
+{
+    private const string LoglevelPadding = ": ";
+    private static readonly string _messagePadding = new string(' ', GetLogLevelString(LogLevel.Information).Length + LoglevelPadding.Length);
+    private static readonly string _newLineWithMessagePadding = Environment.NewLine + _messagePadding;
+    private readonly IDisposable? _optionsReloadToken;
+
+    public SimpleConsoleFormatter(IOptionsMonitor<SimpleConsoleFormatterOptions> options) : base(ConsoleFormatterNames.Simple)
+    {
+        ReloadLoggerOptions(options.CurrentValue);
+        _optionsReloadToken = options.OnChange(ReloadLoggerOptions);
+    }
+
+    // ...
+
+    public override void Write<TState>(in LogEntry<TState> logEntry, IExternalScopeProvider? scopeProvider, TextWriter textWriter)
+    {
+        string message = logEntry.Formatter(logEntry.State, logEntry.Exception);
+        if (logEntry.Exception == null && message == null)
+        {
+            return;
+        }
+        LogLevel logLevel = logEntry.LogLevel;
+        ConsoleColors logLevelColors = GetLogLevelConsoleColors(logLevel);
+        string logLevelString = GetLogLevelString(logLevel);
+ 
+        string? timestamp = null;
+        string? timestampFormat = FormatterOptions.TimestampFormat;
+        if (timestampFormat != null)
+        {
+            DateTimeOffset dateTimeOffset = GetCurrentDateTime();
+            timestamp = dateTimeOffset.ToString(timestampFormat);
+        }
+        if (timestamp != null)
+        {
+            textWriter.Write(timestamp);
+        }
+        if (logLevelString != null)
+        {
+            textWriter.WriteColoredMessage(logLevelString, logLevelColors.Background, logLevelColors.Foreground);
+        }
+        CreateDefaultLogMessage(textWriter, logEntry, message, scopeProvider);
+    }
+
+    private void CreateDefaultLogMessage<TState>(TextWriter textWriter, in LogEntry<TState> logEntry, string message, IExternalScopeProvider? scopeProvider)
+    {
+        bool singleLine = FormatterOptions.SingleLine;
+        int eventId = logEntry.EventId.Id;
+        Exception? exception = logEntry.Exception;
+ 
+        // Example:
+        // info: ConsoleApp.Program[10]
+        //       Request received
+ 
+        // category and event id
+        textWriter.Write(LoglevelPadding);
+        textWriter.Write(logEntry.Category);
+        textWriter.Write('[');
+        // ...
+        WriteScopeInformation(textWriter, scopeProvider, singleLine);
+        WriteMessage(textWriter, message, singleLine);
+        // ...
+    }
+
+    private void WriteScopeInformation(TextWriter textWriter, IExternalScopeProvider? scopeProvider, bool singleLine)  // IExternalScopeProvider is LoggerFactoryScopeProvider
+    {
+        if (FormatterOptions.IncludeScopes && scopeProvider != null)
+        {
+            bool paddingNeeded = !singleLine;
+            scopeProvider.ForEachScope((scope, state) =>  // <--------------------------------------
+            {
+                if (paddingNeeded)
+                {
+                    paddingNeeded = false;
+                    state.Write(_messagePadding);
+                    state.Write("=> ");  // <----------------------now you know why scope in the console print =>
+                }
+                else
+                {
+                    state.Write(" => ");
+                }
+                state.Write(scope);
+            }, textWriter);
+ 
+            if (!paddingNeeded && !singleLine)
+            {
+                textWriter.Write(Environment.NewLine);
+            }
+        }
+    }
+
+    private static void WriteMessage(TextWriter textWriter, string message, bool singleLine)
+    {
+        if (!string.IsNullOrEmpty(message))
+        {
+            if (singleLine)
+            {
+                textWriter.Write(' ');
+                WriteReplacing(textWriter, Environment.NewLine, " ", message);
+            }
+            else
+            {
+                textWriter.Write(_messagePadding);
+                WriteReplacing(textWriter, Environment.NewLine, _newLineWithMessagePadding, message);
+                textWriter.Write(Environment.NewLine);
+            }
+        }
+ 
+        static void WriteReplacing(TextWriter writer, string oldValue, string newValue, string message)
+        {
+            string newMessage = message.Replace(oldValue, newValue);
+            writer.Write(newMessage);
+        }
+    }
+
+} 
+//------------------------------------------Ʌ
 
 //----------------------------------------V
 internal sealed class JsonConsoleFormatter : ConsoleFormatter, IDisposable
@@ -1604,7 +1847,7 @@ internal sealed class ConsoleLogger : ILogger
    }
 
    internal ConsoleFormatter Formatter { get; set; }
-   internal IExternalScopeProvider? ScopeProvider { get; set; }
+   internal IExternalScopeProvider? ScopeProvider { get; set; }  // <---------------LoggerFactoryScopeProvider
    internal ConsoleLoggerOptions Options { get; set; }
    private static StringWriter? t_stringWriter;
 
@@ -1615,7 +1858,7 @@ internal sealed class ConsoleLogger : ILogger
   
       t_stringWriter ??= new StringWriter();
       LogEntry<TState> logEntry = new LogEntry<TState>(logLevel, _name, eventId, state, exception, formatter);
-      Formatter.Write(in logEntry, ScopeProvider, t_stringWriter);
+      Formatter.Write(in logEntry, ScopeProvider, t_stringWriter);  // <----------------------------------------! important this is the actual method that log/write your message
  
       var sb = t_stringWriter.GetStringBuilder();
       if (sb.Length == 0)
@@ -1635,9 +1878,9 @@ internal sealed class ConsoleLogger : ILogger
       return logLevel != LogLevel.None;
    }
 
-   public IDisposable BeginScope<TState>(TState state) 
+   public IDisposable BeginScope<TState>(TState state)  // <-------------------------------------
    {
-      return ScopeProvider?.Push(state) ?? NullScope.Instance;
+      return ScopeProvider?.Push(state) ?? NullScope.Instance;  // return LoggerFactoryScopeProvider.Scope instance
    } 
 }
 //---------------------------------Ʌ

@@ -7,11 +7,7 @@ For an asp.net core application, you will get 6 providers by default, they are:
 
 * `ChainedConfigurationProvider`
 
-* `JsonConfigurationProvider`  (for `appsetting.json`)
-
-* `JsonConfigurationProvider`  (for `appsetting.Development.json`)
-
-* `JsonConfigurationProvider`  (for `secrets.json`)
+* `JsonConfigurationProvider` (for `appsetting.json`, `appsetting.Development.json`, `secrets.json` etc)
 
 * `EnvironmentVariablesConofigurationProvider`
 
