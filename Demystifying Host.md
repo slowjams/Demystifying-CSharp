@@ -88,7 +88,7 @@ public static class WebHost
             }
          }
 
-         config.AddEnvironmentVariables();
+         config.AddEnvironmentVariables();  // <-----------------AddEnvironmentVariables calls after AddJsonFile, that's why EnvironmentVariables overwrites appsetting.json
  
          if (args != null)
          {
@@ -682,7 +682,9 @@ public class HostBuilder : IHostBuilder
        _serviceProviderFactory = new ServiceFactoryAdapter<TContainerBuilder>(factory ?? throw new ArgumentNullException(nameof(factory)));
        return this;
    }
-   ...
+   
+   //...
+
    public IHost Build() {
       if (_hostBuilt) {
          throw new InvalidOperationException("Build can only be called once.");

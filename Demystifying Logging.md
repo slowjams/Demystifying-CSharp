@@ -1,5 +1,33 @@
-Demystifying Logging
-==============================
+## Demystifying Logging
+
+
+```C#
+public class Program
+{
+    public static void Main(string[] args)
+    {
+        CreateHostBuilder(args).Build().Run();
+    }
+
+    public static IHostBuilder CreateHostBuilder(string[] args)
+    {
+        Host.CreateDefaultBuilder(args)
+           .ConfigureLogging((hostBuilderContext, loggingBuilder) =>
+           {
+               loggingBuilder.Configure(options => options.ActivityTrackingOptions = ActivityTrackingOptions.TraceId | ActivityTrackingOptions.SpanId);
+               loggingBuilder.AddConsole(options =>
+               {
+                   options.IncludeScopes = true;
+               });
+           })
+           .ConfigureWebHostDefaults(webBuilder =>
+           {
+               webBuilder.UseStartup<Startup>();
+           });
+    }
+       
+}
+```
 
 ```json
 {
@@ -166,7 +194,9 @@ public class HomeController {
             => ConnectionId:0HN1LUP1092ME => RequestPath:/ RequestId:0HN1LUP1092ME:00000001, SpanId:|8909bd52-4f55d689b02d8489., TraceId:8909bd52-4f55d689b02d8489, ParentId: => DemystifyingLogging.Controllers.HomeController.Index (DemystifyingLogging)
             
             No, I lost it again
-*/
+      
+      also check https://nblumhardt.com/2016/11/ilogger-beginscope/
+      */
    }
 }
 //-------------------------Ʌ 
@@ -333,7 +363,7 @@ public static class LoggingServiceCollectionExtensions
    public static IServiceCollection AddLogging(this IServiceCollection services, Action<ILoggingBuilder> configure)
    {
       services.AddOptions();
- 
+                                                                                          // note it uses `TryAdd`, that's how you can register your own Serilog later
       services.TryAdd(ServiceDescriptor.Singleton<ILoggerFactory, LoggerFactory>());      // <-------------------------
       services.TryAdd(ServiceDescriptor.Singleton(typeof(ILogger<>), typeof(Logger<>)));  // <-------------------------
  
@@ -2175,4 +2205,113 @@ internal readonly struct ScopeLogger
    }
 }
 //----------------------------------Ʌ
+```
+
+
+=================================================================================================================================
+
+## Serilog
+
+
+```C#
+//------------------V
+public class Program
+{
+    public static void Main(string[] args)
+    {
+        CreateHostBuilder(args).Build().Run();
+    }
+
+    public static IHostBuilder CreateHostBuilder(string[] args)
+    {
+        Host.CreateDefaultBuilder(args)
+           .UseSerilog((context, configuration) =>  // (HostBuilderContext context, Serilog.LoggerConfiguration configuration)
+           {
+               configuration
+                   .Enrich.FromLogContext() // allow you use add custom field by `using (LogContext.PushProperty("CustomField", "Hello World"))`, check s1
+                   .Enrich.WithMachineName()
+                   .WriteTo.Console()
+                   .WriteTo.Elasticsearch(
+                       new ElasticsearchSinkOptions(new Uri(context.Configuration["ElasticConfiguration:Uri"]))
+                       {
+                           IndexFormat = $"applogs-{context.HostingEnvironment.ApplicationName?.ToLower().Replace(".", "-")}-{context.HostingEnvironment.EnvironmentName?.ToLower().Replace(".", "-")}-{DateTime.UtcNow:yyyy-MM}",
+                           AutoRegisterTemplate = true,
+                           NumberOfShards = 2,
+                           NumberOfReplicas = 1
+                       }
+                   )
+                   .Enrich.WithProperty("Environment", context.HostingEnvironment.EnvironmentName)
+                   .Enrich.WithProperty("Application", context.HostingEnvironment.ApplicationName)
+                   .ReadFrom.Configuration(context.Configuration);  // read "Serilog" configuration in appsetting.json
+           })
+           .ConfigureWebHostDefaults(webBuilder =>
+           {
+               webBuilder.UseStartup<Startup>();
+           });
+    }      
+}
+//------------------Ʌ
+```
+
+An Elasticsearch **index** is a logical namespace that holds a collection of documents, where each document is a collection of fields — which, in turn, are key-value pairs that contain your data. Elasticsearch indices are not the same as you’d find in a relational database. Think of an Elasticsearch cluster as a database that can contain many indices you can consider as a table, and within each index, you have many documents.
+
+```C#
+public class XXXService : IXXXService
+{
+    private readonly ILogger<XXXService> _logger;
+
+    public CatalogService(ILogger<XXXService> logger)
+    {
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    public async Task<IEnumerable<XXX>> GetXXX()
+    {
+        using (LogContext.PushProperty("CustomField", "Hello World"))  // <----------------------s1
+        {
+            _logger.LogInformation("Getting Catalog Products from url: {url} and custom property : {customProperty}", _client.BaseAddress, 6);
+        }
+
+        // ...
+      
+    }
+}
+```
+
+```json
+{
+  "_index": "applogs-aspnetrunbasics-development-2024-02",
+  "_type": "logevent",
+  "_id": "ZS1Z740BlWyeECfksfGE",
+  "_version": 1,
+  "_score": null,
+  "_source": {
+    "@timestamp": "2024-02-28T21:54:07.9163655+11:00",
+    "level": "Information",
+    "messageTemplate": "Getting Catalog Products from url: {url} and custom property : {customProperty}",
+    "message": "Getting Catalog Products from url: http://localhost:8010/ and custom property : 6",
+    "fields": {
+      "url": "http://localhost:8010/",
+      "customProperty": 6,
+      "SourceContext": "AspnetRunBasics.Services.CatalogService",
+      "ActionId": "09d701e2-37f7-45f3-9d6b-f1d396948533",
+      "ActionName": "/Index",
+      "RequestId": "0HN1O9EB3MKEB:00000002",
+      "RequestPath": "/",
+      "ConnectionId": "0HN1O9EB3MKEB",
+      "CustomField": "Hello World",  // <-------------------------s1
+      "MachineName": "DESKTOP-KLM1TNG",
+      "Environment": "Development",
+      "Application": "AspnetRunBasics"
+    }
+  },
+  "fields": {
+    "@timestamp": [
+      "2024-02-28T10:54:07.916Z"
+    ]
+  },
+  "sort": [
+    1709117647916
+  ]
+}
 ```
