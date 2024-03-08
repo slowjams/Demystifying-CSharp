@@ -2267,6 +2267,7 @@ public class XXXService : IXXXService
 
     public async Task<IEnumerable<XXX>> GetXXX()
     {
+        using (_logger.BeginScope(new Dictionary<string, object> { { "name", "John" }, { "age", 21 } }))
         using (LogContext.PushProperty("CustomField", "Hello World"))  // <----------------------s1
         {
             _logger.LogInformation("Getting Catalog Products from url: {url} and custom property : {customProperty}", _client.BaseAddress, 6);
