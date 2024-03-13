@@ -214,7 +214,26 @@ internal sealed class GenericWebHostBuilder : IWebHostBuilder, ISupportsStartup,
 
 internal sealed partial class GenericWebHostService : IHostedService
 {
-   // via ctor DI
+   public GenericWebHostService(IOptions<GenericWebHostServiceOptions> options, IServer server, ILoggerFactory loggerFactory, DiagnosticListener diagnosticListener,
+                                ActivitySource activitySource, DistributedContextPropagator propagator, IHttpContextFactory httpContextFactory,
+                                IApplicationBuilderFactory applicationBuilderFactory, IEnumerable<IStartupFilter> startupFilters,
+                                IConfiguration configuration, IWebHostEnvironment hostingEnvironment, HostingMetrics hostingMetrics)
+   {
+        Options = options.Value;
+        Server = server;
+        Logger = loggerFactory.CreateLogger("Microsoft.AspNetCore.Hosting.Diagnostics");
+        LifetimeLogger = loggerFactory.CreateLogger("Microsoft.Hosting.Lifetime");
+        DiagnosticListener = diagnosticListener;
+        ActivitySource = activitySource;
+        Propagator = propagator;
+        HttpContextFactory = httpContextFactory;
+        ApplicationBuilderFactory = applicationBuilderFactory;
+        StartupFilters = startupFilters;
+        Configuration = configuration;
+        HostingEnvironment = hostingEnvironment;
+        HostingMetrics = hostingMetrics;
+   }
+   
    public GenericWebHostServiceOptions Options { get; }
    public IServer Server { get; }
    public ILogger Logger { get; }
@@ -761,10 +780,11 @@ public class HostBuilder : IHostBuilder
       _appServices = _serviceProviderFactory.CreateServiceProvider(containerBuilder);   // it registers IServiceProvider internally (in ServiceProviderEngine)
                                                                                         // this is why we can inject IServiceProvider (root scope) into our services
    }
-   ...
+   // ...
 }
 //---------------------------Ʌ
 
+//----------------------------------------V
 public class DefaultServiceProviderFactory : IServiceProviderFactory<IServiceCollection> {
    private readonly ServiceProviderOptions _options;
 
@@ -786,4 +806,681 @@ public class HostBuilderContext {
    public IHostEnvironment HostingEnvironment { get; set; }
    public IDictionary<object, object> Properties { get; }
 }
+//----------------------------------------Ʌ
+```
+
+```C#
+//-------------------------V
+public class WebHostBuilder : IWebHostBuilder
+{
+    private readonly HostingEnvironment _hostingEnvironment;
+    private readonly IConfiguration _config;
+    private readonly WebHostBuilderContext _context;
+ 
+    private WebHostOptions? _options;
+    private bool _webHostBuilt;
+    private Action<WebHostBuilderContext, IServiceCollection>? _configureServices;
+    private Action<WebHostBuilderContext, IConfigurationBuilder>? _configureAppConfigurationBuilder;
+
+    public WebHostBuilder()
+    {
+        _hostingEnvironment = new HostingEnvironment();
+ 
+        _config = new ConfigurationBuilder()
+            .AddEnvironmentVariables(prefix: "ASPNETCORE_")
+            .Build();
+ 
+        if (string.IsNullOrEmpty(GetSetting(WebHostDefaults.EnvironmentKey)))
+        {
+            // Try adding legacy environment keys, never remove these.
+            UseSetting(WebHostDefaults.EnvironmentKey, Environment.GetEnvironmentVariable("Hosting:Environment")
+                ?? Environment.GetEnvironmentVariable("ASPNET_ENV"));
+        }
+ 
+        if (string.IsNullOrEmpty(GetSetting(WebHostDefaults.ServerUrlsKey)))
+        {
+            // Try adding legacy url key, never remove this.
+            UseSetting(WebHostDefaults.ServerUrlsKey, Environment.GetEnvironmentVariable("ASPNETCORE_SERVER.URLS"));
+        }
+ 
+        _context = new WebHostBuilderContext
+        {
+            Configuration = _config
+        };
+    }
+
+    public string? GetSetting(string key)
+    {
+        return _config[key];
+    }
+
+    public IWebHostBuilder UseSetting(string key, string? value)
+    {
+        _config[key] = value;
+        return this;
+    }
+
+    public IWebHostBuilder ConfigureServices(Action<IServiceCollection> configureServices)
+    { 
+        return ConfigureServices((_, services) => configureServices(services));
+    }
+
+    public IWebHostBuilder ConfigureServices(Action<WebHostBuilderContext, IServiceCollection> configureServices)
+    {
+        _configureServices += configureServices;
+        return this;
+    }
+
+    public IWebHostBuilder ConfigureAppConfiguration(Action<WebHostBuilderContext, IConfigurationBuilder> configureDelegate)
+    {
+        _configureAppConfigurationBuilder += configureDelegate;
+        return this;
+    }
+
+    public IWebHost Build()
+    {
+        if (_webHostBuilt)
+        {
+            throw new InvalidOperationException(Resources.WebHostBuilder_SingleInstance);
+        }
+        _webHostBuilt = true;
+ 
+        var hostingServices = BuildCommonServices(out var hostingStartupErrors);
+        var applicationServices = hostingServices.Clone();
+        var hostingServiceProvider = GetProviderFromFactory(hostingServices);
+ 
+        if (!_options.SuppressStatusMessages)
+        {
+            // Warn about deprecated environment variables
+            if (Environment.GetEnvironmentVariable("Hosting:Environment") != null)
+            {
+                Console.WriteLine("The environment variable 'Hosting:Environment' is obsolete and has been replaced with 'ASPNETCORE_ENVIRONMENT'");
+            }
+ 
+            if (Environment.GetEnvironmentVariable("ASPNET_ENV") != null)
+            {
+                Console.WriteLine("The environment variable 'ASPNET_ENV' is obsolete and has been replaced with 'ASPNETCORE_ENVIRONMENT'");
+            }
+ 
+            if (Environment.GetEnvironmentVariable("ASPNETCORE_SERVER.URLS") != null)
+            {
+                Console.WriteLine("The environment variable 'ASPNETCORE_SERVER.URLS' is obsolete and has been replaced with 'ASPNETCORE_URLS'");
+            }
+        }
+ 
+        AddApplicationServices(applicationServices, hostingServiceProvider);
+ 
+        var host = new WebHost(
+            applicationServices,
+            hostingServiceProvider,
+            _options,
+            _config,
+            hostingStartupErrors);
+        try
+        {
+            host.Initialize();
+ 
+            // resolve configuration explicitly once to mark it as resolved within the
+            // service provider, ensuring it will be properly disposed with the provider
+            _ = host.Services.GetService<IConfiguration>();
+ 
+            var logger = host.Services.GetRequiredService<ILogger<WebHost>>();
+ 
+            // Warn about duplicate HostingStartupAssemblies
+            var assemblyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var assemblyName in _options.GetFinalHostingStartupAssemblies())
+            {
+                if (!assemblyNames.Add(assemblyName) && logger.IsEnabled(LogLevel.Warning))
+                {
+                    logger.LogWarning($"The assembly {assemblyName} was specified multiple times. Hosting startup assemblies should only be specified once.");
+                }
+            }
+ 
+            return host;
+        }
+        catch
+        {
+            // Dispose the host if there's a failure to initialize, this should dispose
+            // services that were constructed until the exception was thrown
+            host.Dispose();
+            throw;
+        }
+ 
+        static IServiceProvider GetProviderFromFactory(IServiceCollection collection)
+        {
+            var provider = collection.BuildServiceProvider();
+            var factory = provider.GetService<IServiceProviderFactory<IServiceCollection>>();
+ 
+            if (factory != null && factory is not DefaultServiceProviderFactory)
+            {
+                using (provider)
+                {
+                    return factory.CreateServiceProvider(factory.CreateBuilder(collection));
+                }
+            }
+ 
+            return provider;
+        }
+    }
+
+    private IServiceCollection BuildCommonServices(out AggregateException? hostingStartupErrors)
+    {
+        hostingStartupErrors = null;
+ 
+        _options = new WebHostOptions(_config);
+ 
+        if (!_options.PreventHostingStartup)
+        {
+            var exceptions = new List<Exception>();
+            var processed = new HashSet<Assembly>();
+ 
+            // Execute the hosting startup assemblies
+            foreach (var assemblyName in _options.GetFinalHostingStartupAssemblies())
+            {
+                try
+                {
+                    var assembly = Assembly.Load(new AssemblyName(assemblyName));
+ 
+                    if (!processed.Add(assembly))
+                    {
+                        // Already processed, skip it
+                        continue;
+                    }
+ 
+                    foreach (var attribute in assembly.GetCustomAttributes<HostingStartupAttribute>())
+                    {
+                        var hostingStartup = (IHostingStartup)Activator.CreateInstance(attribute.HostingStartupType)!;
+                        hostingStartup.Configure(this);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Capture any errors that happen during startup
+                    exceptions.Add(new InvalidOperationException($"Startup assembly {assemblyName} failed to execute. See the inner exception for more details.", ex));
+                }
+            }
+ 
+            if (exceptions.Count > 0)
+            {
+                hostingStartupErrors = new AggregateException(exceptions);
+            }
+        }
+ 
+        var contentRootPath = ResolveContentRootPath(_options.ContentRootPath, AppContext.BaseDirectory);
+ 
+        // Initialize the hosting environment
+        ((IWebHostEnvironment)_hostingEnvironment).Initialize(contentRootPath, _options);
+        _context.HostingEnvironment = _hostingEnvironment;
+ 
+        var services = new ServiceCollection();
+        services.AddSingleton(_options);
+        services.AddSingleton<IWebHostEnvironment>(_hostingEnvironment);
+        services.AddSingleton<IHostEnvironment>(_hostingEnvironment);
+        services.AddSingleton<AspNetCore.Hosting.IHostingEnvironment>(_hostingEnvironment);
+        services.AddSingleton<Extensions.Hosting.IHostingEnvironment>(_hostingEnvironment);
+        services.AddSingleton(_context);
+ 
+        var builder = new ConfigurationBuilder()
+            .SetBasePath(_hostingEnvironment.ContentRootPath)
+            .AddConfiguration(_config, shouldDisposeConfiguration: true);
+ 
+        _configureAppConfigurationBuilder?.Invoke(_context, builder);
+ 
+        var configuration = builder.Build();
+        // register configuration as factory to make it dispose with the service provider
+        services.AddSingleton<IConfiguration>(_ => configuration);
+        _context.Configuration = configuration;
+ 
+        services.TryAddSingleton(sp => new DiagnosticListener("Microsoft.AspNetCore"));  // <--------------------
+        services.TryAddSingleton<DiagnosticSource>(sp => sp.GetRequiredService<DiagnosticListener>());
+        services.TryAddSingleton(sp => new ActivitySource("Microsoft.AspNetCore"));  // <----------------------------------------
+        services.TryAddSingleton(DistributedContextPropagator.Current);
+ 
+        services.AddTransient<IApplicationBuilderFactory, ApplicationBuilderFactory>();
+        services.AddTransient<IHttpContextFactory, DefaultHttpContextFactory>();
+        services.AddScoped<IMiddlewareFactory, MiddlewareFactory>();
+        services.AddOptions();
+        services.AddLogging();
+ 
+        services.AddMetrics();
+        services.TryAddSingleton<HostingMetrics>();
+ 
+        services.AddTransient<IServiceProviderFactory<IServiceCollection>, DefaultServiceProviderFactory>();
+ 
+        if (!string.IsNullOrEmpty(_options.StartupAssembly))
+        {
+            ScanAssemblyAndRegisterStartup(services, _options.StartupAssembly);
+        }
+ 
+        _configureServices?.Invoke(_context, services);
+ 
+        return services;
+    }
+
+    private void ScanAssemblyAndRegisterStartup(ServiceCollection services, string startupAssemblyName)
+    {
+        try
+        {
+            var startupType = StartupLoader.FindStartupType(startupAssemblyName, _hostingEnvironment.EnvironmentName);
+ 
+            if (typeof(IStartup).IsAssignableFrom(startupType))
+            {
+                services.AddSingleton(typeof(IStartup), startupType);
+            }
+            else
+            {
+                services.AddSingleton(typeof(IStartup), RegisterStartup);
+ 
+                [UnconditionalSuppressMessage("Trimmer", "IL2077", Justification = "Finding startup type in assembly requires unreferenced code. Surfaced to user in UseStartup(startupAssemblyName).")]
+                object RegisterStartup(IServiceProvider serviceProvider)
+                {
+                    var hostingEnvironment = serviceProvider.GetRequiredService<IHostEnvironment>();
+                    var methods = StartupLoader.LoadMethods(serviceProvider, startupType, hostingEnvironment.EnvironmentName);
+                    return new ConventionBasedStartup(methods);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            var capture = ExceptionDispatchInfo.Capture(ex);
+            services.AddSingleton<IStartup>(_ =>
+            {
+                capture.Throw();
+                return null;
+            });
+        }
+    }
+
+    private static void AddApplicationServices(IServiceCollection services, IServiceProvider hostingServiceProvider)
+    {
+        var listener = hostingServiceProvider.GetService<DiagnosticListener>();
+        services.Replace(ServiceDescriptor.Singleton(typeof(DiagnosticListener), listener!));
+        services.Replace(ServiceDescriptor.Singleton(typeof(DiagnosticSource), listener!));
+ 
+        var activitySource = hostingServiceProvider.GetService<ActivitySource>();
+        services.Replace(ServiceDescriptor.Singleton(typeof(ActivitySource), activitySource!));
+    }
+
+    private static string ResolveContentRootPath(string? contentRootPath, string basePath)
+    {
+        if (string.IsNullOrEmpty(contentRootPath))
+        {
+            return basePath;
+        }
+        if (Path.IsPathRooted(contentRootPath))
+        {
+            return contentRootPath;
+        }
+        return Path.Combine(Path.GetFullPath(basePath), contentRootPath);
+    }
+}
+//-------------------------Ʌ
+```
+
+```C#
+//--------------------------------------V
+internal sealed class HostingApplication : IHttpApplication<HostingApplication.Context>
+{
+    private readonly RequestDelegate _application;
+    private readonly IHttpContextFactory? _httpContextFactory;
+    private readonly DefaultHttpContextFactory? _defaultHttpContextFactory;
+    private readonly HostingApplicationDiagnostics _diagnostics;
+
+    public HostingApplication(RequestDelegate application, ILogger logger, DiagnosticListener diagnosticSource, ActivitySource activitySource,
+                              DistributedContextPropagator propagator, IHttpContextFactory httpContextFactory, HostingEventSource eventSource, HostingMetrics metrics)
+    {
+        _application = application;
+        _diagnostics = new HostingApplicationDiagnostics(logger, diagnosticSource, activitySource, propagator, eventSource, metrics);
+        if (httpContextFactory is DefaultHttpContextFactory factory)
+        {
+            _defaultHttpContextFactory = factory;
+        }
+        else
+        {
+            _httpContextFactory = httpContextFactory;
+        }
+    }
+
+    // Set up the request
+    public Context CreateContext(IFeatureCollection contextFeatures)
+    {
+        Context? hostContext;
+        if (contextFeatures is IHostContextContainer<Context> container)
+        {
+            hostContext = container.HostContext;
+            if (hostContext is null)
+            {
+                hostContext = new Context();
+                container.HostContext = hostContext;
+            }
+        }
+        else
+        {
+            // Server doesn't support pooling, so create a new Context
+            hostContext = new Context();
+        }
+ 
+        HttpContext httpContext;
+        if (_defaultHttpContextFactory != null)
+        {
+            var defaultHttpContext = (DefaultHttpContext?)hostContext.HttpContext;
+            if (defaultHttpContext is null)
+            {
+                httpContext = _defaultHttpContextFactory.Create(contextFeatures);
+                hostContext.HttpContext = httpContext;
+            }
+            else
+            {
+                _defaultHttpContextFactory.Initialize(defaultHttpContext, contextFeatures);
+                httpContext = defaultHttpContext;
+            }
+        }
+        else
+        {
+            httpContext = _httpContextFactory!.Create(contextFeatures);
+            hostContext.HttpContext = httpContext;
+        }
+ 
+        _diagnostics.BeginRequest(httpContext, hostContext);
+        return hostContext;
+    }
+
+     // Execute the request
+    public Task ProcessRequestAsync(Context context)
+    {
+        return _application(context.HttpContext!);
+    }
+ 
+    // Clean up the request
+    public void DisposeContext(Context context, Exception? exception)
+    {
+        var httpContext = context.HttpContext!;
+        _diagnostics.RequestEnd(httpContext, exception, context);
+ 
+        if (_defaultHttpContextFactory != null)
+        {
+            _defaultHttpContextFactory.Dispose((DefaultHttpContext)httpContext);
+ 
+            if (_defaultHttpContextFactory.HttpContextAccessor != null)
+            {
+                // Clear the HttpContext if the accessor was used. It's likely that the lifetime extends
+                // past the end of the http request and we want to avoid changing the reference from under
+                // consumers.
+                context.HttpContext = null;
+            }
+        }
+        else
+        {
+            _httpContextFactory!.Dispose(httpContext);
+        }
+ 
+        _diagnostics.ContextDisposed(context);
+ 
+        // Reset the context as it may be pooled
+        context.Reset();
+    }
+
+    internal sealed class Context
+    {
+        public HttpContext? HttpContext { get; set; }
+        public IDisposable? Scope { get; set; }
+        public Activity? Activity
+        {
+            get => HttpActivityFeature?.Activity;
+            set
+            {
+                if (HttpActivityFeature is null)
+                {
+                    if (value != null)
+                    {
+                        HttpActivityFeature = new HttpActivityFeature(value);
+                    }
+                }
+                else
+                {
+                    HttpActivityFeature.Activity = value!;
+                }
+            }
+        }
+        internal HostingRequestStartingLog? StartLog { get; set; }
+ 
+        public long StartTimestamp { get; set; }
+        internal bool HasDiagnosticListener { get; set; }
+        public bool MetricsEnabled { get; set; }
+        public bool EventLogEnabled { get; set; }
+ 
+        internal HttpActivityFeature? HttpActivityFeature;
+        internal HttpMetricsTagsFeature? MetricsTagsFeature;
+ 
+        public void Reset()
+        {
+            // Not resetting HttpContext here as we pool it on the Context
+ 
+            Scope = null;
+            Activity = null;
+            StartLog = null;
+ 
+            StartTimestamp = 0;
+            HasDiagnosticListener = false;
+            MetricsEnabled = false;
+            EventLogEnabled = false;
+            MetricsTagsFeature?.TagsList.Clear();
+        }
+    }
+}
+//--------------------------------------Ʌ
+
+//-------------------------------------------------V
+internal sealed class HostingApplicationDiagnostics
+{
+    internal const string ActivityName = "Microsoft.AspNetCore.Hosting.HttpRequestIn";  // <-----------that's why the first name of activity in asp.net is "HttpRequestIn"
+    private const string ActivityStartKey = ActivityName + ".Start";
+    private const string ActivityStopKey = ActivityName + ".Stop";
+ 
+    private const string DeprecatedDiagnosticsBeginRequestKey = "Microsoft.AspNetCore.Hosting.BeginRequest";
+    private const string DeprecatedDiagnosticsEndRequestKey = "Microsoft.AspNetCore.Hosting.EndRequest";
+    private const string DiagnosticsUnhandledExceptionKey = "Microsoft.AspNetCore.Hosting.UnhandledException";
+ 
+    private const string RequestUnhandledKey = "__RequestUnhandled";
+ 
+    private readonly ActivitySource _activitySource;
+    private readonly DiagnosticListener _diagnosticListener;
+    private readonly DistributedContextPropagator _propagator;
+    private readonly HostingEventSource _eventSource;
+    private readonly HostingMetrics _metrics;
+    private readonly ILogger _logger;
+
+    public HostingApplicationDiagnostics(ILogger logger, DiagnosticListener diagnosticListener, ActivitySource activitySource, DistributedContextPropagator propagator,
+                                         HostingEventSource eventSource, HostingMetrics metrics)
+    {
+        _logger = logger;
+        _diagnosticListener = diagnosticListener;
+        _activitySource = activitySource;
+        _propagator = propagator;
+        _eventSource = eventSource;
+        _metrics = metrics;
+    }
+
+    public void BeginRequest(HttpContext httpContext, HostingApplication.Context context)
+    {
+        long startTimestamp = 0;
+ 
+        if (_metrics.IsEnabled())
+        {
+            context.MetricsEnabled = true;
+            context.MetricsTagsFeature ??= new HttpMetricsTagsFeature();
+            httpContext.Features.Set<IHttpMetricsTagsFeature>(context.MetricsTagsFeature);
+ 
+            startTimestamp = Stopwatch.GetTimestamp();
+ 
+            // To keep the hot path short we defer logging in this function to non-inlines
+            RecordRequestStartMetrics(httpContext);
+        }
+ 
+        if (_eventSource.IsEnabled())
+        {
+            context.EventLogEnabled = true;
+ 
+            if (startTimestamp == 0)
+            {
+                startTimestamp = Stopwatch.GetTimestamp();
+            }
+ 
+            // To keep the hot path short we defer logging in this function to non-inlines
+            RecordRequestStartEventLog(httpContext);
+        }
+ 
+        var diagnosticListenerEnabled = _diagnosticListener.IsEnabled();
+        var diagnosticListenerActivityCreationEnabled = (diagnosticListenerEnabled && _diagnosticListener.IsEnabled(ActivityName, httpContext));
+        var loggingEnabled = _logger.IsEnabled(LogLevel.Critical);
+ 
+        if (loggingEnabled || diagnosticListenerActivityCreationEnabled || _activitySource.HasListeners())
+        {
+            context.Activity = StartActivity(httpContext, loggingEnabled, diagnosticListenerActivityCreationEnabled, out var hasDiagnosticListener);
+            context.HasDiagnosticListener = hasDiagnosticListener;
+ 
+            if (context.Activity != null)
+            {
+                httpContext.Features.Set<IHttpActivityFeature>(context.HttpActivityFeature);
+            }
+        }
+ 
+        if (diagnosticListenerEnabled)
+        {
+            if (_diagnosticListener.IsEnabled(DeprecatedDiagnosticsBeginRequestKey))
+            {
+                if (startTimestamp == 0)
+                {
+                    startTimestamp = Stopwatch.GetTimestamp();
+                }
+ 
+                RecordBeginRequestDiagnostics(httpContext, startTimestamp);
+            }
+        }
+ 
+        // To avoid allocation, return a null scope if the logger is not on at least to some degree.
+        if (loggingEnabled)
+        {
+            // Scope may be relevant for a different level of logging, so we always create it
+            // see: https://github.com/aspnet/Hosting/pull/944
+            // Scope can be null if logging is not on.
+            context.Scope = Log.RequestScope(_logger, httpContext);
+ 
+            if (_logger.IsEnabled(LogLevel.Information))
+            {
+                if (startTimestamp == 0)
+                {
+                    startTimestamp = Stopwatch.GetTimestamp();
+                }
+ 
+                // Non-inline
+                LogRequestStarting(context);
+            }
+        }
+        context.StartTimestamp = startTimestamp;
+    }
+
+    public void RequestEnd(HttpContext httpContext, Exception? exception, HostingApplication.Context context)
+    {
+        // Local cache items resolved multiple items, in order of use so they are primed in cpu pipeline when used
+        var startTimestamp = context.StartTimestamp;
+        long currentTimestamp = 0;
+ 
+        // startTimestamp has a value if:
+        // - Information logging was enabled at for this request (and calculated time will be wildly wrong)
+        //   Is used as proxy to reduce calls to virtual: _logger.IsEnabled(LogLevel.Information)
+        // - EventLog or metrics was enabled
+        if (startTimestamp != 0)
+        {
+            currentTimestamp = Stopwatch.GetTimestamp();
+            var reachedPipelineEnd = httpContext.Items.ContainsKey(RequestUnhandledKey);
+ 
+            // Non-inline
+            LogRequestFinished(context, startTimestamp, currentTimestamp);
+ 
+            if (context.MetricsEnabled)
+            {
+                var endpoint = HttpExtensions.GetOriginalEndpoint(httpContext);
+                var route = endpoint?.Metadata.GetMetadata<IRouteDiagnosticsMetadata>()?.Route;
+                var customTags = context.MetricsTagsFeature?.TagsList;
+ 
+                _metrics.RequestEnd(
+                    httpContext.Request.Protocol,
+                    httpContext.Request.IsHttps,
+                    httpContext.Request.Scheme,
+                    httpContext.Request.Method,
+                    httpContext.Request.Host,
+                    route,
+                    httpContext.Response.StatusCode,
+                    reachedPipelineEnd,
+                    exception,
+                    customTags,
+                    startTimestamp,
+                    currentTimestamp);
+            }
+ 
+            if (reachedPipelineEnd)
+            {
+                LogRequestUnhandled(context);
+            }
+        }
+ 
+        if (_diagnosticListener.IsEnabled())
+        {
+            if (currentTimestamp == 0)
+            {
+                currentTimestamp = Stopwatch.GetTimestamp();
+            }
+ 
+            if (exception == null)
+            {
+                // No exception was thrown, request was successful
+                if (_diagnosticListener.IsEnabled(DeprecatedDiagnosticsEndRequestKey))
+                {
+                    // Diagnostics is enabled for EndRequest, but it may not be for BeginRequest
+                    // so call GetTimestamp if currentTimestamp is zero (from above)
+                    RecordEndRequestDiagnostics(httpContext, currentTimestamp);
+                }
+            }
+            else
+            {
+                // Exception was thrown from request
+                if (_diagnosticListener.IsEnabled(DiagnosticsUnhandledExceptionKey))
+                {
+                    // Diagnostics is enabled for UnhandledException, but it may not be for BeginRequest
+                    // so call GetTimestamp if currentTimestamp is zero (from above)
+                    RecordUnhandledExceptionDiagnostics(httpContext, currentTimestamp, exception);
+                }
+            }
+        }
+ 
+        var activity = context.Activity;
+        // Always stop activity if it was started
+        if (activity is not null)
+        {
+            StopActivity(httpContext, activity, context.HasDiagnosticListener);
+        }
+ 
+        if (context.EventLogEnabled)
+        {
+            if (exception != null)
+            {
+                // Non-inline
+                _eventSource.UnhandledException();
+            }
+ 
+            // Count 500 as failed requests
+            if (httpContext.Response.StatusCode >= 500)
+            {
+                _eventSource.RequestFailed();
+            }
+        }
+ 
+        // Logging Scope is finshed with
+        context.Scope?.Dispose();
+    }
+
+    // ...
+}
+//-------------------------------------------------Ʌ
 ```

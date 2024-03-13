@@ -2295,6 +2295,8 @@ public class XXXService : IXXXService
       "url": "http://localhost:8010/",
       "customProperty": 6,
       "SourceContext": "AspnetRunBasics.Services.CatalogService",
+      "name": "John",  // <------------------------from BeginScope()
+      "age": 21,       // <------------------------from BeginScope()
       "ActionId": "09d701e2-37f7-45f3-9d6b-f1d396948533",
       "ActionName": "/Index",
       "RequestId": "0HN1O9EB3MKEB:00000002",
