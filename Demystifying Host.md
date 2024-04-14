@@ -259,7 +259,7 @@ internal sealed partial class GenericWebHostService : IHostedService
       // build the request pipeline
       application = builder.Build();   // <--------------------------------------------- that's when all Middleware instances are created
 
-      var httpApplication = new HostingApplication(application, Logger, DiagnosticListener, ActivitySource, Propagator, HttpContextFactory);
+      var httpApplication = new HostingApplication(application, Logger, DiagnosticListener, ActivitySource, Propagator, HttpContextFactory);  // <-------------------t1
  
       await Server.StartAsync(httpApplication, cancellationToken);
 
@@ -1031,9 +1031,9 @@ public class WebHostBuilder : IWebHostBuilder
         services.AddSingleton<IConfiguration>(_ => configuration);
         _context.Configuration = configuration;
  
-        services.TryAddSingleton(sp => new DiagnosticListener("Microsoft.AspNetCore"));  // <--------------------
+        services.TryAddSingleton(sp => new DiagnosticListener("Microsoft.AspNetCore"));  // <------------------------------------t0
         services.TryAddSingleton<DiagnosticSource>(sp => sp.GetRequiredService<DiagnosticListener>());
-        services.TryAddSingleton(sp => new ActivitySource("Microsoft.AspNetCore"));  // <----------------------------------------
+        services.TryAddSingleton(sp => new ActivitySource("Microsoft.AspNetCore"));  // <----------------------------------------t0
         services.TryAddSingleton(DistributedContextPropagator.Current);
  
         services.AddTransient<IApplicationBuilderFactory, ApplicationBuilderFactory>();
@@ -1130,7 +1130,7 @@ internal sealed class HostingApplication : IHttpApplication<HostingApplication.C
                               DistributedContextPropagator propagator, IHttpContextFactory httpContextFactory, HostingEventSource eventSource, HostingMetrics metrics)
     {
         _application = application;
-        _diagnostics = new HostingApplicationDiagnostics(logger, diagnosticSource, activitySource, propagator, eventSource, metrics);
+        _diagnostics = new HostingApplicationDiagnostics(logger, diagnosticSource, activitySource, propagator, eventSource, metrics);  // <--------------------------t2
         if (httpContextFactory is DefaultHttpContextFactory factory)
         {
             _defaultHttpContextFactory = factory;
@@ -1380,6 +1380,97 @@ internal sealed class HostingApplicationDiagnostics
         context.StartTimestamp = startTimestamp;
     }
 
+    private Activity? StartActivity(HttpContext httpContext, bool loggingEnabled, bool diagnosticListenerActivityCreationEnabled, out bool hasDiagnosticListener)
+    {
+        hasDiagnosticListener = false;
+ 
+        var headers = httpContext.Request.Headers;
+        _propagator.ExtractTraceIdAndState(headers,
+            static (object? carrier, string fieldName, out string? fieldValue, out IEnumerable<string>? fieldValues) =>
+            {
+                fieldValues = default;
+                var headers = (IHeaderDictionary)carrier!;
+                fieldValue = headers[fieldName];
+            },
+            out var requestId,
+            out var traceState);
+ 
+        Activity? activity = null;
+        if (_activitySource.HasListeners())
+        {
+            if (ActivityContext.TryParse(requestId, traceState, isRemote: true, out ActivityContext context))
+            {
+                // The requestId used the W3C ID format. Unfortunately, the ActivitySource.CreateActivity overload that
+                // takes a string parentId never sets HasRemoteParent to true. We work around that by calling the
+                // ActivityContext overload instead which sets HasRemoteParent to parentContext.IsRemote.
+                // https://github.com/dotnet/aspnetcore/pull/41568#discussion_r868733305
+                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, context);
+            }
+            else
+            {
+                // Pass in the ID we got from the headers if there was one.
+                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, string.IsNullOrEmpty(requestId) ? null! : requestId);
+            }
+        }
+ 
+        if (activity is null)
+        {
+            // CreateActivity didn't create an Activity (this is an optimization for the
+            // case when there are no listeners). Let's create it here if needed.
+            if (loggingEnabled || diagnosticListenerActivityCreationEnabled)
+            {
+                activity = new Activity(ActivityName);
+                if (!string.IsNullOrEmpty(requestId))
+                {
+                    activity.SetParentId(requestId);
+                }
+            }
+            else
+            {
+                return null;
+            }
+        }
+ 
+        if (!string.IsNullOrEmpty(requestId))
+        {
+            if (!string.IsNullOrEmpty(traceState))
+            {
+                activity.TraceStateString = traceState;
+            }
+            var baggage = _propagator.ExtractBaggage(headers, static (object? carrier, string fieldName, out string? fieldValue, out IEnumerable<string>? fieldValues) =>
+            {
+                fieldValues = default;
+                var headers = (IHeaderDictionary)carrier!;
+                fieldValue = headers[fieldName];
+            });
+ 
+            // AddBaggage adds items at the beginning  of the list, so we need to add them in reverse to keep the same order as the client
+            // By contract, the propagator has already reversed the order of items so we need not reverse it again
+            // Order could be important if baggage has two items with the same key (that is allowed by the contract)
+            if (baggage is not null)
+            {
+                foreach (var baggageItem in baggage)
+                {
+                    activity.AddBaggage(baggageItem.Key, baggageItem.Value);
+                }
+            }
+        }
+ 
+        _diagnosticListener.OnActivityImport(activity, httpContext);
+ 
+        if (_diagnosticListener.IsEnabled(ActivityStartKey))
+        {
+            hasDiagnosticListener = true;
+            StartActivity(activity, httpContext);
+        }
+        else
+        {
+            activity.Start();
+        }
+ 
+        return activity;
+    }
+
     public void RequestEnd(HttpContext httpContext, Exception? exception, HostingApplication.Context context)
     {
         // Local cache items resolved multiple items, in order of use so they are primed in cpu pipeline when used
@@ -1480,6 +1571,17 @@ internal sealed class HostingApplicationDiagnostics
         context.Scope?.Dispose();
     }
 
+    private void StopActivity(HttpContext httpContext, Activity activity, bool hasDiagnosticListener)
+    {
+        if (hasDiagnosticListener)
+        {
+            StopActivity(activity, httpContext);
+        }
+        else
+        {
+            activity.Stop();
+        }
+    }
     // ...
 }
 //-------------------------------------------------Ʌ

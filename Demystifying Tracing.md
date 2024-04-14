@@ -277,9 +277,33 @@ public sealed class ActivitySource : IDisposable
 {
     private static readonly SynchronizedList<ActivitySource> s_activeSources = new SynchronizedList<ActivitySource>();     // <-------------------static
     private static readonly SynchronizedList<ActivityListener> s_allListeners = new SynchronizedList<ActivityListener>();  // <-------------------static
-    private SynchronizedList<ActivityListener>? _listeners;
+    private SynchronizedList<ActivityListener>? _listeners;  // <--------------non static listener
     
-    public ActivitySource(string name, string? version = "");
+    public ActivitySource(string name, string? version = "")
+    {
+        Name = name ?? throw new ArgumentNullException(nameof(name));
+        Version = version;
+ 
+        s_activeSources.Add(this);  // <------------------------add itself
+ 
+        if (s_allListeners.Count > 0)
+        {
+            s_allListeners.EnumWithAction((listener, source) =>
+            {
+                Func<ActivitySource, bool>? shouldListenTo = listener.ShouldListenTo;
+                if (shouldListenTo != null)
+                {
+                    var activitySource = (ActivitySource)source;
+                    if (shouldListenTo(activitySource))
+                    {
+                        activitySource.AddListener(listener);  // <-------------------------
+                    }
+                }
+            }, this);
+        }
+ 
+        GC.KeepAlive(DiagnosticSourceEventSource.Log);
+    }
 
 	public string Name { get; }
 	public string? Version { get; }
