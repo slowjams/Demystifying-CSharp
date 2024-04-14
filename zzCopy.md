@@ -220,7 +220,7 @@ public partial class HttpClientHandler : HttpMessageHandler
  
     public HttpClientHandler()
     {
-        _underlyingHandler = new HttpHandlerType();
+        _underlyingHandler = new SocketsHttpHandler();
  
         ClientCertificateOptions = ClientCertificateOption.Manual;
     }
@@ -899,7 +899,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
         }
     }
 
-    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler();
+    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler(); 
 
     public override IList<DelegatingHandler> AdditionalHandlers { get; } = new List<DelegatingHandler>();
  

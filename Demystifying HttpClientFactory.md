@@ -220,7 +220,7 @@ public partial class HttpClientHandler : HttpMessageHandler
  
     public HttpClientHandler()
     {
-        _underlyingHandler = new HttpHandlerType();
+        _underlyingHandler = new SocketsHttpHandler();  // <-----------------------------------
  
         ClientCertificateOptions = ClientCertificateOption.Manual;
     }
@@ -549,7 +549,7 @@ public static class HttpClientFactoryServiceCollectionExtensions
         services.TryAdd(ServiceDescriptor.Singleton(typeof(DefaultTypedHttpClientFactory<>.Cache), typeof(DefaultTypedHttpClientFactory<>.Cache)));
  
         // Misc infrastructure
-        services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, LoggingHttpMessageHandlerBuilderFilter>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, LoggingHttpMessageHandlerBuilderFilter>());  // Add LoggingScopeHttpMessageHandler
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, MetricsFactoryHttpMessageHandlerFilter>());
  
         // This is used to track state and report errors **DURING** service registration. This has to be an instance because we access it by reaching into the service collection.
@@ -842,6 +842,18 @@ internal sealed class ActiveHandlerTrackingEntry
 }
 //----------------------------------------------Ʌ
 
+//------------------------------------------------------V
+internal sealed class LifetimeTrackingHttpMessageHandler : DelegatingHandler
+{
+    public LifetimeTrackingHttpMessageHandler(HttpMessageHandler innerHandler) : base(innerHandler) { }
+ 
+    protected override void Dispose(bool disposing)
+    {
+        // the lifetime of this is tracked separately by ActiveHandlerTrackingEntry
+    }
+}
+//------------------------------------------------------Ʌ
+
 //---------------------------------------------V
 public abstract class HttpMessageHandlerBuilder
 {
@@ -899,7 +911,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
         }
     }
 
-    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler();
+    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler();  // <------------------- use SocketsHttpHandler
 
     public override IList<DelegatingHandler> AdditionalHandlers { get; } = new List<DelegatingHandler>();
  
