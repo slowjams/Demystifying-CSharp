@@ -18,8 +18,10 @@ public class Startup
 }
 ```
 
-https://medium.com/@organicprogrammer/why-tcp-connection-termination-needs-four-way-handshake-90d68bb82816
+https://andrewlock.net/exporing-the-code-behind-ihttpclientfactory/
+https://www.meziantou.net/avoid-dns-issues-with-httpclient-in-dotnet.htm
 https://www.stevejgordon.co.uk/introduction-to-httpclientfactory-aspnetcore
+https://medium.com/@organicprogrammer/why-tcp-connection-termination-needs-four-way-handshake-90d68bb82816
 https://learn.microsoft.com/en-us/dotnet/architecture/microservices/implement-resilient-applications/use-httpclientfactory-to-implement-resilient-http-requests
 
 basd on the articles above, if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the HttpClientHandler which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
@@ -291,6 +293,26 @@ public sealed class SocketsHttpHandler : HttpMessageHandler
     {
         get => _settings._useCookies;
         set => _settings._useCookies = value;
+    }
+
+    public TimeSpan PooledConnectionLifetime
+    {
+        get => _settings._pooledConnectionLifetime;
+        set
+        {
+            // ...
+            _settings._pooledConnectionLifetime = value;
+        }
+    }
+ 
+    public TimeSpan PooledConnectionIdleTimeout
+    {
+        get => _settings._pooledConnectionIdleTimeout;
+        set
+        {          
+            // ...
+             _settings._pooledConnectionIdleTimeout = value;
+        }
     }
     // ...
 
@@ -578,18 +600,12 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
     // 10 distinct named clients * expiry time >= 1s = approximate cleanup queue of 100 items, this seems frequent enough
     private readonly TimeSpan DefaultCleanupInterval = TimeSpan.FromSeconds(10);
  
-    // we use a new timer for each regular cleanup cycle, protected with a lock. Note that this scheme
-    // doesn't give us anything to dispose, as the timer is started/stopped as needed.
-    // there's no need for the factory itself to be disposable. If you stop using it, eventually everything will get reclaimed.
     private Timer? _cleanupTimer;
     private readonly object _cleanupTimerLock;
     private readonly object _cleanupActiveLock;
  
-    // collection of 'active' handlers. Using lazy for synchronization to ensure that only one instance of HttpMessageHandler is created for each name. internal for tests
-    internal readonly ConcurrentDictionary<string, Lazy<ActiveHandlerTrackingEntry>> _activeHandlers;
+    internal readonly ConcurrentDictionary<string, Lazy<ActiveHandlerTrackingEntry>> _activeHandlers;  // <------------------------------------
  
-    // collection of 'expired' but not yet disposed handlers, used when we're rotating handlers so that we can dispose HttpMessageHandler instances once they
-    // are eligible for garbage collection, internal for tests
     internal readonly ConcurrentQueue<ExpiredHandlerTrackingEntry> _expiredHandlers;
     private readonly TimerCallback _expiryCallback;
 
@@ -610,7 +626,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         {
             return new Lazy<ActiveHandlerTrackingEntry>(() =>
             {
-                return CreateHandlerEntry(name);
+                return CreateHandlerEntry(name);  // <----------------------------------------------
             }, LazyThreadSafetyMode.ExecutionAndPublication);
         };
  
@@ -652,7 +668,6 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         return entry.Handler;
     }
 
-    // internal for tests
     internal ActiveHandlerTrackingEntry CreateHandlerEntry(string name)
     {
         IServiceProvider services = _services;
@@ -754,6 +769,79 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
 }
 //-------------------------------------Ʌ
 
+//----------------------------------------------V
+internal sealed class ActiveHandlerTrackingEntry
+{
+    private static readonly TimerCallback _timerCallback = (s) => ((ActiveHandlerTrackingEntry)s!).Timer_Tick();
+    private readonly object _lock;
+    private bool _timerInitialized;
+    private Timer? _timer;
+    private TimerCallback? _callback;
+
+    public ActiveHandlerTrackingEntry(string name, LifetimeTrackingHttpMessageHandler handler, IServiceScope? scope, TimeSpan lifetime)
+    {
+        Name = name;
+        Handler = handler;
+        Scope = scope;
+        Lifetime = lifetime;
+ 
+        _lock = new object();
+    }
+
+    public LifetimeTrackingHttpMessageHandler Handler { get; }
+ 
+    public TimeSpan Lifetime { get; }
+ 
+    public string Name { get; }
+ 
+    public IServiceScope? Scope { get; }
+ 
+    public void StartExpiryTimer(TimerCallback callback)
+    {
+        if (Lifetime == Timeout.InfiniteTimeSpan)
+        {
+                return; // never expires.
+        }
+ 
+        if (Volatile.Read(ref _timerInitialized))
+        {
+            return;
+        }
+ 
+        StartExpiryTimerSlow(callback);
+    }
+
+    private void StartExpiryTimerSlow(TimerCallback callback)
+    { 
+        lock (_lock)
+        {
+            if (Volatile.Read(ref _timerInitialized))
+            {
+                return;
+            }
+ 
+            _callback = callback;
+            _timer = NonCapturingTimer.Create(_timerCallback, this, Lifetime, Timeout.InfiniteTimeSpan);
+            _timerInitialized = true;
+        }
+    }
+
+    private void Timer_Tick()
+    { 
+        lock (_lock)
+        {
+            if (_timer != null)
+            {
+                _timer.Dispose();
+                _timer = null;
+ 
+                _callback(this);
+            }
+        }
+    }
+}
+//----------------------------------------------Ʌ
+
 //---------------------------------------------V
 public abstract class HttpMessageHandlerBuilder
 {
@@ -849,8 +937,40 @@ public class HttpClientFactoryOptions
     internal bool SuppressDefaultLogging { get; set; }
     internal List<Action<HttpMessageHandlerBuilder>> LoggingBuilderActions { get; } = new List<Action<HttpMessageHandlerBuilder>>(); 
 }
-
 //-----------------------------------Ʌ
+
+//------------------------------------------V
+internal sealed class HttpConnectionSettings
+{
+    // maximal connection lifetime in the pool regardless of whether the connection is idle or active. The connection is reestablished
+    // periodically to reflect the DNS or other network changes, set this value to to a short period like TimeSpan.FromMinutes(1) is prefered
+    internal TimeSpan _pooledConnectionLifetime = HttpHandlerDefaults.DefaultPooledConnectionLifetime;        // default is Timeout.InfiniteTimeSpan
+    
+    // maximum idle time for a connection in the pool. When there is no request in the provided delay, the connection is released.
+    internal TimeSpan _pooledConnectionIdleTimeout = HttpHandlerDefaults.DefaultPooledConnectionIdleTimeout;  // default is TimeSpan.FromMinutes(1);
+    // ...
+}
+//------------------------------------------Ʌ
+
+internal static partial class HttpHandlerDefaults
+{
+    public const int DefaultMaxAutomaticRedirections = 50;
+    public const int DefaultMaxResponseDrainSize = 1024 * 1024;
+    public static readonly TimeSpan DefaultResponseDrainTimeout = TimeSpan.FromSeconds(2);
+    public const int DefaultMaxResponseHeadersLength = 64; // Units in K (1024) bytes.
+    public const DecompressionMethods DefaultAutomaticDecompression = DecompressionMethods.None;
+    public const bool DefaultAutomaticRedirection = true;
+    public const bool DefaultUseCookies = true;
+    public const bool DefaultPreAuthenticate = false;
+    public const ClientCertificateOption DefaultClientCertificateOption = ClientCertificateOption.Manual;
+    public const bool DefaultUseProxy = true;
+    public const bool DefaultUseDefaultCredentials = false;
+    public const bool DefaultCheckCertificateRevocationList = false;
+        public static readonly TimeSpan DefaultPooledConnectionLifetime = Timeout.InfiniteTimeSpan;
+        public static readonly TimeSpan DefaultPooledConnectionIdleTimeout = TimeSpan.FromMinutes(1);
+        public static readonly TimeSpan DefaultExpect100ContinueTimeout = TimeSpan.FromSeconds(1);
+        public static readonly TimeSpan DefaultConnectTimeout = Timeout.InfiniteTimeSpan;
+}
 ```
 
 
