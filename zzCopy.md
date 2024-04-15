@@ -976,6 +976,76 @@ internal static partial class HttpHandlerDefaults
 
 ```C#
 //-----------------------------V
+public class HttpMessageInvoker : IDisposable
+{
+    private volatile bool _disposed;
+    private readonly bool _disposeHandler;
+    private readonly HttpMessageHandler _handler;
+ 
+    public HttpMessageInvoker(HttpMessageHandler handler) : this(handler, true) { }
+
+    public HttpMessageInvoker(HttpMessageHandler handler, bool disposeHandler)
+    { 
+        _handler = handler;
+        _disposeHandler = disposeHandler;
+    }
+
+    public virtual HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        if (ShouldSendWithTelemetry(request))
+        {
+            HttpTelemetry.Log.RequestStart(request);
+ 
+            HttpResponseMessage? response = null;
+            try
+            {
+                response = _handler.Send(request, cancellationToken);
+                return response;
+            }
+            catch (Exception ex) when (LogRequestFailed(ex, telemetryStarted: true))
+            {
+                // unreachable as LogRequestFailed will return false
+                throw;
+            }
+            finally
+            {
+                HttpTelemetry.Log.RequestStop(response);
+            }
+        }
+        else
+        {
+            return _handler.Send(request, cancellationToken);
+        }
+    }
+
+    public virtual Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        // ...
+        return _handler.SendAsync(request, cancellationToken);
+    }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+ 
+    protected virtual void Dispose(bool disposing)
+    {
+        if (disposing && !_disposed)
+        {
+            _disposed = true;
+            if (_disposeHandler)  // <-------------------------pass false for IHttpClientFactory to manage disposing
+            {
+                _handler.Dispose();
+            }
+        }
+    }
+    // ...
+}
+//-----------------------------Ʌ
+
+//-----------------------------V
 public partial class HttpClient : HttpMessageInvoker
 {
     private static IWebProxy? s_defaultProxy;
@@ -1080,55 +1150,6 @@ public partial class HttpClient : HttpMessageInvoker
             FinishSend(response, cts, disposeCts, telemetryStarted, responseContentTelemetryStarted);
         }
     }
-
-    // ...
-}
-//-----------------------------Ʌ
-
-//-----------------------------V
-public class HttpMessageInvoker : IDisposable
-{
-    private volatile bool _disposed;
-    private readonly bool _disposeHandler;
-    private readonly HttpMessageHandler _handler;
- 
-    public HttpMessageInvoker(HttpMessageHandler handler) : this(handler, true) { }
-
-    public HttpMessageInvoker(HttpMessageHandler handler, bool disposeHandler)
-    { 
-        _handler = handler;
-        _disposeHandler = disposeHandler;
-    }
-
-    public virtual HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
-    {
-        if (ShouldSendWithTelemetry(request))
-        {
-            HttpTelemetry.Log.RequestStart(request);
- 
-            HttpResponseMessage? response = null;
-            try
-            {
-                response = _handler.Send(request, cancellationToken);
-                return response;
-            }
-            catch (Exception ex) when (LogRequestFailed(ex, telemetryStarted: true))
-            {
-                // unreachable as LogRequestFailed will return false
-                throw;
-            }
-            finally
-            {
-                HttpTelemetry.Log.RequestStop(response);
-            }
-        }
-        else
-        {
-            return _handler.Send(request, cancellationToken);
-        }
-    }
-
-    public virtual Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken);
 
     // ...
 }

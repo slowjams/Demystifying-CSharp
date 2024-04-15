@@ -18,24 +18,11 @@ public class Startup
 }
 ```
 
-The RFC, anticipating (or reacting to) this problem, states:
-
-When a connection is closed actively, it MUST linger in TIME-WAIT state for a time 2xMSL (Maximum Segment Lifetime). However, **it MAY accept a new SYN from the remote TCP to reopen the connection directly from TIME-WAIT state**, if it:
-
-(1)  assigns its initial sequence number for the new connection to be larger than the largest sequence number it used on the previous connection incarnation, and
-
-(2)  returns to TIME-WAIT state if the SYN turns out to be an old duplicate”
-
-
-https://blog.davidvassallo.me/2010/07/13/time_wait-and-port-reuse/
-https://www.stevejgordon.co.uk/httpclient-connection-pooling-in-dotnet-core
 https://andrewlock.net/exporing-the-code-behind-ihttpclientfactory/
 https://www.meziantou.net/avoid-dns-issues-with-httpclient-in-dotnet.htm
 https://www.stevejgordon.co.uk/introduction-to-httpclientfactory-aspnetcore
 https://medium.com/@organicprogrammer/why-tcp-connection-termination-needs-four-way-handshake-90d68bb82816
 https://learn.microsoft.com/en-us/dotnet/architecture/microservices/implement-resilient-applications/use-httpclientfactory-to-implement-resilient-http-requests
-
-
 
 basd on the articles above, if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the HttpClientHandler which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
 
@@ -157,7 +144,7 @@ public abstract class HttpMessageHandler : IDisposable
 
     protected internal abstract Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken);
 
-    protected virtual void Dispose(bool disposing)  // <-------------------look like underlying TCP connection goes to TIME-WAIT when you call dispose on HttpClient
+    protected virtual void Dispose(bool disposing)
     {
         // Nothing to do in base class.
     }
@@ -233,7 +220,7 @@ public partial class HttpClientHandler : HttpMessageHandler
  
     public HttpClientHandler()
     {
-        _underlyingHandler = new SocketsHttpHandler();  // <-----------------------------------
+        _underlyingHandler = new SocketsHttpHandler();
  
         ClientCertificateOptions = ClientCertificateOption.Manual;
     }
@@ -295,7 +282,7 @@ public partial class HttpClientHandler : HttpMessageHandler
 //------------------------------------Ʌ
 
 //------------------------------------V
-public sealed class SocketsHttpHandler : HttpMessageHandler  // <-------------the last piece to communicate to TCP Transport Layer 
+public sealed class SocketsHttpHandler : HttpMessageHandler
 {
     private readonly HttpConnectionSettings _settings = new HttpConnectionSettings();
     private HttpMessageHandlerStage? _handler;
@@ -333,7 +320,7 @@ public sealed class SocketsHttpHandler : HttpMessageHandler  // <-------------th
     {
         HttpConnectionSettings settings = _settings.CloneAndNormalize();
  
-        HttpConnectionPoolManager poolManager = new HttpConnectionPoolManager(settings);  // <--------------------------------
+        HttpConnectionPoolManager poolManager = new HttpConnectionPoolManager(settings);
  
         HttpMessageHandlerStage handler;
  
@@ -451,7 +438,7 @@ internal sealed class HttpConnectionPoolManager : IDisposable
     public HttpConnectionPoolManager(HttpConnectionSettings settings)
     {
         _settings = settings;
-        _pools = new ConcurrentDictionary<HttpConnectionKey, HttpConnectionPool>();  // <------------------------------------------
+        _pools = new ConcurrentDictionary<HttpConnectionKey, HttpConnectionPool>();
 
         // ...
     }
@@ -562,7 +549,7 @@ public static class HttpClientFactoryServiceCollectionExtensions
         services.TryAdd(ServiceDescriptor.Singleton(typeof(DefaultTypedHttpClientFactory<>.Cache), typeof(DefaultTypedHttpClientFactory<>.Cache)));
  
         // Misc infrastructure
-        services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, LoggingHttpMessageHandlerBuilderFilter>());  // Add LoggingScopeHttpMessageHandler
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, LoggingHttpMessageHandlerBuilderFilter>());
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, MetricsFactoryHttpMessageHandlerFilter>());
  
         // This is used to track state and report errors **DURING** service registration. This has to be an instance because we access it by reaching into the service collection.
@@ -661,11 +648,8 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
     public HttpClient CreateClient(string name)
     { 
         HttpMessageHandler handler = CreateHandler(name);
-
-        // even though we call  `new HttpClient`, that doesn't mean we cannot pool connection, the key is to reuse an underlying handler
-        // compared to the traditinal approach
-        var client = new HttpClient(handler, disposeHandler: false);  // <-------------------disposeHandler: false argument ensures that disposing the HttpClient  
-                                                                      // doesn't dispose the handler pipeline, as the IHttpClientFactory will handle that itself
+        var client = new HttpClient(handler, disposeHandler: false);
+ 
         HttpClientFactoryOptions options = _optionsMonitor.Get(name);
         for (int i = 0; i < options.HttpClientActions.Count; i++)
         {
@@ -804,7 +788,7 @@ internal sealed class ActiveHandlerTrackingEntry
         _lock = new object();
     }
 
-    public LifetimeTrackingHttpMessageHandler Handler { get; }  // <-----------------------------
+    public LifetimeTrackingHttpMessageHandler Handler { get; }  
  
     public TimeSpan Lifetime { get; }
  
@@ -857,18 +841,6 @@ internal sealed class ActiveHandlerTrackingEntry
     }
 }
 //----------------------------------------------Ʌ
-
-//------------------------------------------------------V
-internal sealed class LifetimeTrackingHttpMessageHandler : DelegatingHandler
-{
-    public LifetimeTrackingHttpMessageHandler(HttpMessageHandler innerHandler) : base(innerHandler) { }
- 
-    protected override void Dispose(bool disposing)
-    {
-        // the lifetime of this is tracked separately by ActiveHandlerTrackingEntry
-    }
-}
-//------------------------------------------------------Ʌ
 
 //---------------------------------------------V
 public abstract class HttpMessageHandlerBuilder
@@ -927,7 +899,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
         }
     }
 
-    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler();  // <------------------- use SocketsHttpHandler
+    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler(); 
 
     public override IList<DelegatingHandler> AdditionalHandlers { get; } = new List<DelegatingHandler>();
  
@@ -1032,9 +1004,8 @@ public partial class HttpClient : HttpMessageInvoker
     public TimeSpan Timeout { get; set; }
     public long MaxResponseContentBufferSize { get; set; }
 
-    public HttpClient() : this(new HttpClientHandler()) { }  // <------------create a new underlying HttpClientHandler/SocketsHttpHandler, so connection won't be pooled because
-                                                             // a new port will be used every time if you new up multiple HttpClient; the connection can still pooled if you use
-                                                             // a single HttpClient (a single port) with appropriate PooledConnectionLifetime and PooledConnectionIdleTimeout settings
+    public HttpClient() : this(new HttpClientHandler()) { }
+
     public HttpClient(HttpMessageHandler handler) : this(handler, true) { }
 
     public HttpClient(HttpMessageHandler handler, bool disposeHandler) : base(handler, disposeHandler)
@@ -1157,29 +1128,8 @@ public class HttpMessageInvoker : IDisposable
         }
     }
 
-    public virtual Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-    {
-        // ...
-        return _handler.SendAsync(request, cancellationToken);
-    }
+    public virtual Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken);
 
-    public void Dispose()
-    {
-        Dispose(true);
-        GC.SuppressFinalize(this);
-    }
- 
-    protected virtual void Dispose(bool disposing)
-    {
-        if (disposing && !_disposed)
-        {
-            _disposed = true;
-            if (_disposeHandler)  // <-------------------------pass false for IHttpClientFactory to manage disposing
-            {
-                _handler.Dispose();
-            }
-        }
-    }
     // ...
 }
 //-----------------------------Ʌ
