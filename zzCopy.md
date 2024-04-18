@@ -18,21 +18,107 @@ public class Startup
 }
 ```
 
+The RFC, anticipating (or reacting to) this problem, states:
+
+When a connection is closed actively, it MUST linger in TIME-WAIT state for a time 2xMSL (Maximum Segment Lifetime). However, **it MAY accept a new SYN from the remote TCP to reopen the connection directly from TIME-WAIT state**, if it:
+
+(1)  assigns its initial sequence number for the new connection to be larger than the largest sequence number it used on the previous connection incarnation, and
+
+(2)  returns to TIME-WAIT state if the SYN turns out to be an old duplicate”
+
+
+https://blog.davidvassallo.me/2010/07/13/time_wait-and-port-reuse/
+https://medium.com/@nuno.caneco/c-httpclient-should-not-be-disposed-or-should-it-45d2a8f568bc
+https://www.stevejgordon.co.uk/httpclient-connection-pooling-in-dotnet-core
 https://andrewlock.net/exporing-the-code-behind-ihttpclientfactory/
 https://www.meziantou.net/avoid-dns-issues-with-httpclient-in-dotnet.htm
 https://www.stevejgordon.co.uk/introduction-to-httpclientfactory-aspnetcore
 https://medium.com/@organicprogrammer/why-tcp-connection-termination-needs-four-way-handshake-90d68bb82816
 https://learn.microsoft.com/en-us/dotnet/architecture/microservices/implement-resilient-applications/use-httpclientfactory-to-implement-resilient-http-requests
 
+
+
 basd on the articles above, if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the HttpClientHandler which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
 
 By using `IHttpClientFactory`, it assigns an `HttpMessageHandler` from a pool to the HttpClient. `HttpClient` may (or may not) use an existing HttpClientHandler from the pool and therefore use an existing open connection.
 
+
+## How to use HttpClient like IHttpClientFactory
+
+The `SocketsHttpHandler` establishes a pool of connections for each unique endpoint which your application makes an outbound HTTP request to via `HttpClient`. On the first request to an endpoint, when no existing connections exist, a new HTTP connection will be established and used for the request. Once that request completes, the connection is left open and is returned into the pool.
+
+```C#
+var socketsHandler = new SocketsHttpHandler
+{
+    PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+    MaxConnectionsPerServer = 10
+};
+
+var client = new HttpClient(socketsHandler);  // <---------------------you have to pass and use the same HttpClient instance like static
+for (var i = 0; i < 5; i++)
+{
+    await client.GetAsync("https://www.google.com");
+}
+
+/* only one TCP connection
+TCP   192.168.1.139:53040   216.58.211.164:443   ESTABLISHED   20372
+*/
+```
+```C#
+// if you new up HttpClient for each request there will be 5 TCP connections
+for (var i = 0; i < 5; i++)
+{
+    var client = new HttpClient();  // <--------------- new up HttpClientHandler/SocketsHttpHandler for each request. Each SocketsHttpHandler manages a separate HttpConnectionPool
+    await client.GetAsync("https://www.google.com");
+}
+
+/*
+TCP   192.168.1.139:53115   216.58.211.164:443   TIME_WAIT     0
+TCP   192.168.1.139:53116   216.58.211.164:443   TIME_WAIT     0
+TCP   192.168.1.139:53118   216.58.211.164:443   TIME_WAIT     0
+TCP   192.168.1.139:53120   216.58.211.164:443   TIME_WAIT     0
+TCP   192.168.1.139:53121   216.58.211.164:443   TIME_WAIT     0
+*/
+
+public partial class HttpClient : HttpMessageInvoker
+{
+    // ...
+    public HttpClient() : this(new HttpClientHandler()) { }  
+
+    public HttpClient(HttpMessageHandler handler) : this(handler, true) { }
+}
+```
+
+note that if you don't re-use `HttpClient`, says you create another one
+
+```C#
+var socketsHandler2 = new SocketsHttpHandler
+{
+    PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+    MaxConnectionsPerServer = 10
+};
+
+var client2 = new HttpClient(socketsHandler2); 
+await client.GetAsync("https://www.google.com");
+```
+
+So if you use a static `HttpClient` correctly with appropriate settings of `PooledConnectionLifetime` and `PooledConnectionIdleTimeout`, you can achieve the same effects as `IHttpClientFactory`, so "DO I STILL NEED IHTTPCLIENTFACTORY?" from https://www.stevejgordon.co.uk/httpclient-connection-pooling-in-dotnet-core
+
+> This is a very logical question which may arise as the result of this post. One of the features of IHttpClientFactory is the lifetime management of HttpMessageHandler chains and as a result, also of the underlying connections. Armed with the knowledge that HttpClient and SocketsHttpHandler can achieve the same effect, do we need to bother with IHttpClientFactory?
+
+> My view is that IHttpClientFactory has other benefits beyond helping manage connection lifetimes and still adds value when making outbound HTTP requests. It provides a great pattern to define logical configurations for HttpClient instances using the named or typed client approaches. The later, typed clients is a personal favourite of mine.
+
+> The fluent configuration approach to these logical clients also makes the use of custom DelegatingHandlers with clients very straightforward and clear. This includes the extension of this approach by the ASP.NET team to integrate with Polly in order to easily apply resiliency and transient fault handling for outbound requests.
+
+> Even without the lifetime management piece, I expect to use the factory in my applications for some time to come. From discussions I’ve seen online, it’s quite possible that in future releases, the lifetime management functionality will be deprecated and/or removed from IHttpClientFactory, since the problem it was solving is no longer applicable.**
+
 ==========================================================================================================================
 
 
-
 # Source Code
+
 
 ```C#
 public static partial class HttpClientBuilderExtensions
@@ -144,7 +230,7 @@ public abstract class HttpMessageHandler : IDisposable
 
     protected internal abstract Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken);
 
-    protected virtual void Dispose(bool disposing)
+    protected virtual void Dispose(bool disposing)  // <-------------------look like underlying TCP connection goes to TIME-WAIT when you call dispose on HttpClient
     {
         // Nothing to do in base class.
     }
@@ -220,7 +306,7 @@ public partial class HttpClientHandler : HttpMessageHandler
  
     public HttpClientHandler()
     {
-        _underlyingHandler = new SocketsHttpHandler();
+        _underlyingHandler = new SocketsHttpHandler();  // <-----------------------------------
  
         ClientCertificateOptions = ClientCertificateOption.Manual;
     }
@@ -282,7 +368,7 @@ public partial class HttpClientHandler : HttpMessageHandler
 //------------------------------------Ʌ
 
 //------------------------------------V
-public sealed class SocketsHttpHandler : HttpMessageHandler
+public sealed class SocketsHttpHandler : HttpMessageHandler  // <-------------the last piece to communicate to TCP Transport Layer 
 {
     private readonly HttpConnectionSettings _settings = new HttpConnectionSettings();
     private HttpMessageHandlerStage? _handler;
@@ -320,7 +406,7 @@ public sealed class SocketsHttpHandler : HttpMessageHandler
     {
         HttpConnectionSettings settings = _settings.CloneAndNormalize();
  
-        HttpConnectionPoolManager poolManager = new HttpConnectionPoolManager(settings);
+        HttpConnectionPoolManager poolManager = new HttpConnectionPoolManager(settings);  // <--------------------------------
  
         HttpMessageHandlerStage handler;
  
@@ -421,6 +507,7 @@ internal abstract class HttpMessageHandlerStage : HttpMessageHandler
 }
 //---------------------------------------------Ʌ
 
+//---------------------------------------------V
 internal sealed class HttpConnectionPoolManager : IDisposable
 {
     private readonly TimeSpan _cleanPoolTimeout;  // how frequently an operation should be initiated to clean out old pools and connections in those pools
@@ -438,7 +525,7 @@ internal sealed class HttpConnectionPoolManager : IDisposable
     public HttpConnectionPoolManager(HttpConnectionSettings settings)
     {
         _settings = settings;
-        _pools = new ConcurrentDictionary<HttpConnectionKey, HttpConnectionPool>();
+        _pools = new ConcurrentDictionary<HttpConnectionKey, HttpConnectionPool>();  // <------------------------------------------
 
         // ...
     }
@@ -519,6 +606,71 @@ internal sealed class HttpConnectionPoolManager : IDisposable
         return SendAsyncCore(request, proxyUri, async, doRequestAuth, isProxyConnect: false, cancellationToken);
     }
 }
+//---------------------------------------------Ʌ
+
+//----------------------------------------------V
+internal sealed partial class HttpConnectionPool : IDisposable  // provides a pool of connections to the same endpoint
+{
+    private const int MaxConnectionFailureRetries = 3;
+    public const int DefaultHttpPort = 80;  // port to connect in client's perspectives
+    public const int DefaultHttpsPort = 443;
+ 
+    private static readonly bool s_isWindows7Or2008R2 = GetIsWindows7Or2008R2();
+    private static readonly List<SslApplicationProtocol> s_http3ApplicationProtocols = new List<SslApplicationProtocol>() { SslApplicationProtocol.Http3 };
+    private static readonly List<SslApplicationProtocol> s_http2ApplicationProtocols = new List<SslApplicationProtocol>() { SslApplicationProtocol.Http2, SslApplicationProtocol.Http11 };
+    private static readonly List<SslApplicationProtocol> s_http2OnlyApplicationProtocols = new List<SslApplicationProtocol>() { SslApplicationProtocol.Http2 };
+ 
+    private readonly HttpConnectionPoolManager _poolManager;
+    private readonly HttpConnectionKind _kind;
+    private readonly Uri? _proxyUri;
+    // ...
+
+    public HttpConnectionPool(HttpConnectionPoolManager poolManager, HttpConnectionKind kind, string? host, int port, string? sslHostName, Uri? proxyUri);
+
+    public ValueTask<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, bool doRequestAuth, CancellationToken cancellationToken)
+    {
+        // ...
+        return SendWithProxyAuthAsync(request, async, doRequestAuth, cancellationToken);   // eventually calls Http2Connection.SendAsync()
+
+        //
+    }
+}
+
+internal sealed partial class HttpConnectionPool
+{
+     
+    private List<Http2Connection>? _availableHttp2Connections;  // list of available HTTP/2 connections stored in the pool
+    private int _associatedHttp2ConnectionCount;                // The number of HTTP/2 connections associated with the pool, including in use, available, and pending
+    private bool _pendingHttp2Connection;                       // Indicates whether an HTTP/2 connection is in the process of being established
+    private RequestQueue<Http2Connection?> _http2RequestQueue;  // Queue of requests waiting for an HTTP/2 connection
+ 
+    private bool _http2Enabled;
+    private byte[]? _http2AltSvcOriginUri;
+    internal readonly byte[]? _http2EncodedAuthorityHostHeader;
+
+    // ...
+}
+
+internal sealed partial class Http2Connection : HttpConnectionBase  // large class (2000 lines) with a lot of low level stuff
+{
+    // ...
+    public Http2Connection(HttpConnectionPool pool, Stream stream, IPEndPoint? remoteEndPoint) : base(pool, remoteEndPoint)
+    {
+        _pool = pool;
+        _stream = stream;
+        // ...
+        _keepAlivePingDelay = TimeSpanToMs(_pool.Settings._keepAlivePingDelay);
+        _keepAlivePingTimeout = TimeSpanToMs(_pool.Settings._keepAlivePingTimeout);
+        _nextPingRequestTimestamp = Environment.TickCount64 + _keepAlivePingDelay;
+        _keepAlivePingPolicy = _pool.Settings._keepAlivePingPolicy;
+    }
+
+    public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, CancellationToken cancellationToken)
+    {
+        // ...
+    }
+}
+//----------------------------------------------Ʌ
 ```
 
 
@@ -549,7 +701,7 @@ public static class HttpClientFactoryServiceCollectionExtensions
         services.TryAdd(ServiceDescriptor.Singleton(typeof(DefaultTypedHttpClientFactory<>.Cache), typeof(DefaultTypedHttpClientFactory<>.Cache)));
  
         // Misc infrastructure
-        services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, LoggingHttpMessageHandlerBuilderFilter>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, LoggingHttpMessageHandlerBuilderFilter>());  // Add LoggingScopeHttpMessageHandler
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHttpMessageHandlerBuilderFilter, MetricsFactoryHttpMessageHandlerFilter>());
  
         // This is used to track state and report errors **DURING** service registration. This has to be an instance because we access it by reaching into the service collection.
@@ -606,7 +758,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
  
     internal readonly ConcurrentDictionary<string, Lazy<ActiveHandlerTrackingEntry>> _activeHandlers;  // <------------------------------------
  
-    internal readonly ConcurrentQueue<ExpiredHandlerTrackingEntry> _expiredHandlers;
+    internal readonly ConcurrentQueue<ExpiredHandlerTrackingEntry> _expiredHandlers;  
     private readonly TimerCallback _expiryCallback;
 
     public DefaultHttpClientFactory(
@@ -648,8 +800,11 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
     public HttpClient CreateClient(string name)
     { 
         HttpMessageHandler handler = CreateHandler(name);
-        var client = new HttpClient(handler, disposeHandler: false);
- 
+
+        // even though we call  `new HttpClient`, that doesn't mean we cannot pool connection, the key is to reuse an underlying handler
+        // compared to the traditinal approach
+        var client = new HttpClient(handler, disposeHandler: false);  // <-------------------disposeHandler: false argument ensures that disposing the HttpClient  
+                                                                      // doesn't dispose the handler pipeline, as the IHttpClientFactory will handle that itself
         HttpClientFactoryOptions options = _optionsMonitor.Get(name);
         for (int i = 0; i < options.HttpClientActions.Count; i++)
         {
@@ -694,12 +849,8 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
             configure(builder);
  
             // wrap the handler so we can ensure the inner handler outlives the outer handler.
-            var handler = new LifetimeTrackingHttpMessageHandler(builder.Build());
+            var handler = new LifetimeTrackingHttpMessageHandler(builder.Build());  // <----------------------------------------
  
-            // note that we can't start the timer here. That would introduce a very very subtle race condition
-            // with very short expiry times. We need to wait until we've actually handed out the handler once to start the timer.
-            // otherwise it would be possible that we start the timer here, immediately expire it (very short  timer) and then dispose it without ever creating a client
-            // that would be bad. it's unlikely this would happen, but we want to be sure
             return new ActiveHandlerTrackingEntry(name, handler, scope, options.HandlerLifetime);
  
             void Configure(HttpMessageHandlerBuilder b)
@@ -709,7 +860,6 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
                     options.HttpMessageHandlerBuilderActions[i](b);
                 }
  
-                // Logging is added separately in the end. But for now it should be still possible to override it via filters...
                 foreach (Action<HttpMessageHandlerBuilder> action in options.LoggingBuilderActions)
                 {
                     action(b);
@@ -788,7 +938,7 @@ internal sealed class ActiveHandlerTrackingEntry
         _lock = new object();
     }
 
-    public LifetimeTrackingHttpMessageHandler Handler { get; }
+    public LifetimeTrackingHttpMessageHandler Handler { get; }  // <-----------------------------
  
     public TimeSpan Lifetime { get; }
  
@@ -841,6 +991,18 @@ internal sealed class ActiveHandlerTrackingEntry
     }
 }
 //----------------------------------------------Ʌ
+
+//------------------------------------------------------V
+internal sealed class LifetimeTrackingHttpMessageHandler : DelegatingHandler
+{
+    public LifetimeTrackingHttpMessageHandler(HttpMessageHandler innerHandler) : base(innerHandler) { }
+ 
+    protected override void Dispose(bool disposing)
+    {
+        // the lifetime of this is tracked separately by ActiveHandlerTrackingEntry
+    }
+}
+//------------------------------------------------------Ʌ
 
 //---------------------------------------------V
 public abstract class HttpMessageHandlerBuilder
@@ -899,7 +1061,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
         }
     }
 
-    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler(); 
+    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler();  // <------------------- use SocketsHttpHandler
 
     public override IList<DelegatingHandler> AdditionalHandlers { get; } = new List<DelegatingHandler>();
  
@@ -940,7 +1102,7 @@ public class HttpClientFactoryOptions
 //-----------------------------------Ʌ
 
 //------------------------------------------V
-internal sealed class HttpConnectionSettings
+internal sealed class HttpConnectionSettings  // <----------------------------
 {
     // maximal connection lifetime in the pool regardless of whether the connection is idle or active. The connection is reestablished
     // periodically to reflect the DNS or other network changes, set this value to to a short period like TimeSpan.FromMinutes(1) is prefered
@@ -966,85 +1128,15 @@ internal static partial class HttpHandlerDefaults
     public const bool DefaultUseProxy = true;
     public const bool DefaultUseDefaultCredentials = false;
     public const bool DefaultCheckCertificateRevocationList = false;
-        public static readonly TimeSpan DefaultPooledConnectionLifetime = Timeout.InfiniteTimeSpan;
-        public static readonly TimeSpan DefaultPooledConnectionIdleTimeout = TimeSpan.FromMinutes(1);
-        public static readonly TimeSpan DefaultExpect100ContinueTimeout = TimeSpan.FromSeconds(1);
-        public static readonly TimeSpan DefaultConnectTimeout = Timeout.InfiniteTimeSpan;
+    public static readonly TimeSpan DefaultPooledConnectionLifetime = Timeout.InfiniteTimeSpan;
+    public static readonly TimeSpan DefaultPooledConnectionIdleTimeout = TimeSpan.FromMinutes(1);
+    public static readonly TimeSpan DefaultExpect100ContinueTimeout = TimeSpan.FromSeconds(1);
+    public static readonly TimeSpan DefaultConnectTimeout = Timeout.InfiniteTimeSpan;
 }
 ```
 
 
 ```C#
-//-----------------------------V
-public class HttpMessageInvoker : IDisposable
-{
-    private volatile bool _disposed;
-    private readonly bool _disposeHandler;
-    private readonly HttpMessageHandler _handler;
- 
-    public HttpMessageInvoker(HttpMessageHandler handler) : this(handler, true) { }
-
-    public HttpMessageInvoker(HttpMessageHandler handler, bool disposeHandler)
-    { 
-        _handler = handler;
-        _disposeHandler = disposeHandler;
-    }
-
-    public virtual HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
-    {
-        if (ShouldSendWithTelemetry(request))
-        {
-            HttpTelemetry.Log.RequestStart(request);
- 
-            HttpResponseMessage? response = null;
-            try
-            {
-                response = _handler.Send(request, cancellationToken);
-                return response;
-            }
-            catch (Exception ex) when (LogRequestFailed(ex, telemetryStarted: true))
-            {
-                // unreachable as LogRequestFailed will return false
-                throw;
-            }
-            finally
-            {
-                HttpTelemetry.Log.RequestStop(response);
-            }
-        }
-        else
-        {
-            return _handler.Send(request, cancellationToken);
-        }
-    }
-
-    public virtual Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-    {
-        // ...
-        return _handler.SendAsync(request, cancellationToken);
-    }
-
-    public void Dispose()
-    {
-        Dispose(true);
-        GC.SuppressFinalize(this);
-    }
- 
-    protected virtual void Dispose(bool disposing)
-    {
-        if (disposing && !_disposed)
-        {
-            _disposed = true;
-            if (_disposeHandler)  // <-------------------------pass false for IHttpClientFactory to manage disposing
-            {
-                _handler.Dispose();
-            }
-        }
-    }
-    // ...
-}
-//-----------------------------Ʌ
-
 //-----------------------------V
 public partial class HttpClient : HttpMessageInvoker
 {
@@ -1074,8 +1166,9 @@ public partial class HttpClient : HttpMessageInvoker
     public TimeSpan Timeout { get; set; }
     public long MaxResponseContentBufferSize { get; set; }
 
-    public HttpClient() : this(new HttpClientHandler()) { }
-
+    public HttpClient() : this(new HttpClientHandler()) { }  // <------------create a new underlying HttpClientHandler/SocketsHttpHandler, so connection won't be pooled because
+                                                             // a new port will be used every time if you new up multiple HttpClient; the connection can still pooled if you use
+                                                             // a single HttpClient (a single port) with appropriate PooledConnectionLifetime and PooledConnectionIdleTimeout settings
     public HttpClient(HttpMessageHandler handler) : this(handler, true) { }
 
     public HttpClient(HttpMessageHandler handler, bool disposeHandler) : base(handler, disposeHandler)
@@ -1151,6 +1244,76 @@ public partial class HttpClient : HttpMessageInvoker
         }
     }
 
+    // ...
+}
+//-----------------------------Ʌ
+
+//-----------------------------V
+public class HttpMessageInvoker : IDisposable
+{
+    private volatile bool _disposed;
+    private readonly bool _disposeHandler;
+    private readonly HttpMessageHandler _handler;
+ 
+    public HttpMessageInvoker(HttpMessageHandler handler) : this(handler, true) { }
+
+    public HttpMessageInvoker(HttpMessageHandler handler, bool disposeHandler)
+    { 
+        _handler = handler;
+        _disposeHandler = disposeHandler;
+    }
+
+    public virtual HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        if (ShouldSendWithTelemetry(request))
+        {
+            HttpTelemetry.Log.RequestStart(request);
+ 
+            HttpResponseMessage? response = null;
+            try
+            {
+                response = _handler.Send(request, cancellationToken);
+                return response;
+            }
+            catch (Exception ex) when (LogRequestFailed(ex, telemetryStarted: true))
+            {
+                // unreachable as LogRequestFailed will return false
+                throw;
+            }
+            finally
+            {
+                HttpTelemetry.Log.RequestStop(response);
+            }
+        }
+        else
+        {
+            return _handler.Send(request, cancellationToken);
+        }
+    }
+
+    public virtual Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        // ...
+        return _handler.SendAsync(request, cancellationToken);
+    }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+ 
+    protected virtual void Dispose(bool disposing)
+    {
+        if (disposing && !_disposed)
+        {
+            _disposed = true;
+            if (_disposeHandler)  // <-------------------------pass false for IHttpClientFactory to manage disposing
+            {
+                _handler.Dispose();
+            }
+        }
+    }
     // ...
 }
 //-----------------------------Ʌ
