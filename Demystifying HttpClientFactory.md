@@ -201,6 +201,11 @@ So how does it work internally?
 
 When using `IHttpClientFactory`, created `HttpClientHandler`/`SocketsHttpHandler` are wrapped in `LifetimeTrackingHttpMessageHandler` which has a default **2 mins** lifetime. New freseh created `LifetimeTrackingHttpMessageHandler` will be placed into ` _activeHandlers` and there is a Timer to check if the handler is expired, if it is, those handlers will be placed into 
 `_expiredHandlers` and there is another Timer that periodically does a check in **every 10 secs** to see if expired handlers can be disposed. The criteria to dispose a handler is to use `WeakReference` to see if the handler is being referenced (client2 in the above example)
+
+<-----------------add example of combining usage of setting SocketHandler and IHttpClientFactory with handler lifetime setting to Inifinitely
+
+
+<--------------add scopeAware example to explain why the httpcontext's scope is different than builder's own scope
 ==========================================================================================================================
 
 
@@ -808,6 +813,9 @@ public static class HttpClientFactoryServiceCollectionExtensions
         services.TryAddTransient<HttpMessageHandlerBuilder, DefaultHttpMessageHandlerBuilder>();
         services.TryAddSingleton<DefaultHttpClientFactory>();
         services.TryAddSingleton<IHttpClientFactory>(serviceProvider => serviceProvider.GetRequiredService<DefaultHttpClientFactory>());
+
+        // you might wonder why this registration is needed as it is almost identical as the above registration
+        // this will be used to ScopeAwareHttpClientFactory // <-----------------------------------
         services.TryAddSingleton<IHttpMessageHandlerFactory>(serviceProvider => serviceProvider.GetRequiredService<DefaultHttpClientFactory>());
  
         // Typed Clients
@@ -950,7 +958,9 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
  
         try
         {
-            HttpMessageHandlerBuilder builder = services.GetRequiredService<HttpMessageHandlerBuilder>();
+            // _scopeFactory.CreateScope() is used to create HttpMessageHandlerBuilder and  this scope will be injected into HttpMessageHandlerBuilder's constructor,
+            // this scope is different to HttpContext scope, which might cause issues if you don't use it properly
+            HttpMessageHandlerBuilder builder = services.GetRequiredService<HttpMessageHandlerBuilder>();  // <-------------------------
             builder.Name = name;
  
             Action<HttpMessageHandlerBuilder> configure = Configure;
@@ -1028,7 +1038,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         }
     }
 
-    internal void CleanupTimer_Tick();
+    internal void CleanupTimer_Tick();  // <------------------------------- add source code 
 }
 //-------------------------------------Ʌ
 
@@ -1431,6 +1441,9 @@ public class HttpMessageInvoker : IDisposable
 }
 //-----------------------------Ʌ
 ```
+
+<----------------------!!!write down what will happen when you call using() on the client created by IHttpClientFactory, nothing happen
+
 
 References:
 
