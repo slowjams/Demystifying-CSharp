@@ -2,6 +2,72 @@
 
 
 ```C#
+//-----------------------------V
+public partial class HttpClient : HttpMessageInvoker  // HttpMessageInvoker implements IDisposable, so when you call `Dispose` (use using block) on `HttpClient`
+{                                                     // the underlying TCP connection goes to TIME_WAIT state immediately
+    
+    public HttpClient() : this(new HttpClientHandler()) { };
+    public HttpClient(HttpMessageHandler handler) : this(handler, true) { }
+    public HttpClient(HttpMessageHandler handler, bool disposeHandler) : base(handler, disposeHandler){ }
+    // ...
+}
+//-----------------------------Ʌ
+
+//-----------------------------V
+public class HttpMessageInvoker : IDisposable
+{
+    private readonly bool _disposeHandler;
+    private readonly HttpMessageHandler _handler;
+ 
+    public HttpMessageInvoker(HttpMessageHandler handler) : this(handler, true) { }
+
+    public HttpMessageInvoker(HttpMessageHandler handler, bool disposeHandler)
+    { 
+        _handler = handler;
+        _disposeHandler = disposeHandler;
+    }
+    
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+ 
+    protected virtual void Dispose(bool disposing)
+    {
+        if (disposing && !_disposed)
+        {
+            _disposed = true;
+            if (_disposeHandler)  // <-------------pass false for IHttpClientFactory to manage disposing, so you can use `using` to dispose the HttpClient created from IHttpClientFactory
+            {                     // this ensures that disposing the HttpClient doesn't dispose the handler pipeline, as the IHttpClientFactory will handle that itself
+                _handler.Dispose();
+            }
+        }
+    }
+}
+//-----------------------------Ʌ
+
+//-------------------------------------V
+internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandlerFactory
+{
+    // ...
+    public HttpClient CreateClient(string name)
+    { 
+        HttpMessageHandler handler = CreateHandler(name);
+
+        // even though we call `new HttpClient`, that doesn't mean we cannot pool connection
+        // the key is to reuse an underlying handler compared to the traditinal approach
+        var client = new HttpClient(handler, disposeHandler: false);  // <-------------------disposeHandler: false argument ensures that disposing the HttpClient  
+                                                                      // doesn't dispose the handler pipeline, as the IHttpClientFactory will handle that itself
+        // ...
+
+        return client;
+    }
+}
+//-------------------------------------Ʌ
+```
+
+```C#
 public class Startup
 {
 
@@ -21,6 +87,8 @@ public class Startup
 if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the HttpClientHandler which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
 
 By using `IHttpClientFactory`, it assigns an `HttpMessageHandler` from a pool to the HttpClient. `HttpClient` may (or may not) use an existing HttpClientHandler from the pool and therefore use an existing open connection.
+
+<----------------------!!!write down what will happen when you call using() on the client created by IHttpClientFactory, nothing happen
 
 
 ## How to use HttpClient like IHttpClientFactory
@@ -206,9 +274,9 @@ When using `IHttpClientFactory`, created `HttpClientHandler`/`SocketsHttpHandler
 
 
 <--------------add scopeAware example to explain why the httpcontext's scope is different than builder's own scope
-==========================================================================================================================
+==========================aas================================================================================================
 
-
+ggf
 # Source Code
 
 
@@ -222,8 +290,7 @@ public static partial class HttpClientBuilderExtensions
         return builder;
     }
 
-    // ...
-
+    // <---------------important, that's how custom DelegatingHandlers are added, also note that scope which is not the same as HttpContext's scope
     public static IHttpClientBuilder AddHttpMessageHandler<THandler>(this IHttpClientBuilder builder) where THandler : DelegatingHandler
     { 
         builder.Services.Configure<HttpClientFactoryOptions>(builder.Name, options =>
@@ -233,6 +300,8 @@ public static partial class HttpClientBuilderExtensions
  
         return builder;
     }
+
+    // ...
 
     public static IHttpClientBuilder ConfigurePrimaryHttpMessageHandler(this IHttpClientBuilder builder, Func<HttpMessageHandler> configureHandler)
     { 
@@ -952,13 +1021,13 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         HttpClientFactoryOptions options = _optionsMonitor.Get(name);
         if (!options.SuppressHandlerScope)
         {
-            scope = _scopeFactory.CreateScope();
+            scope = _scopeFactory.CreateScope();  // <---------------------important!
             services = scope.ServiceProvider;
         }
  
         try
         {
-            // _scopeFactory.CreateScope() is used to create HttpMessageHandlerBuilder and  this scope will be injected into HttpMessageHandlerBuilder's constructor,
+            // _scopeFactory.CreateScope() is used to create HttpMessageHandlerBuilder and this scope will be injected into HttpMessageHandlerBuilder's constructor,
             // this scope is different to HttpContext scope, which might cause issues if you don't use it properly
             HttpMessageHandlerBuilder builder = services.GetRequiredService<HttpMessageHandlerBuilder>();  // <-------------------------
             builder.Name = name;
@@ -980,7 +1049,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
             {
                 for (int i = 0; i < options.HttpMessageHandlerBuilderActions.Count; i++)
                 {
-                    options.HttpMessageHandlerBuilderActions[i](b);
+                    options.HttpMessageHandlerBuilderActions[i](b);  // <--------------important! HttpMessageHandlerBuilder's scope will be used to create DelegatingHandlers
                 }
  
                 foreach (Action<HttpMessageHandlerBuilder> action in options.LoggingBuilderActions)
@@ -1132,8 +1201,8 @@ public abstract class HttpMessageHandlerBuilder
 {
     public abstract string? Name { get; set; }
     public abstract HttpMessageHandler PrimaryHandler { get; set; }
-    public abstract IList<DelegatingHandler> AdditionalHandlers { get; }
-    public virtual IServiceProvider Services { get; } = null!;
+    public abstract IList<DelegatingHandler> AdditionalHandlers { get; }  // <---------contains custom DelegatingHandlers created by the scope below
+    public virtual IServiceProvider Services { get; } = null!;  // <------------important, this is the scope to be used to create DelegatingHandlers
 
     public abstract HttpMessageHandler Build();
 
@@ -1176,8 +1245,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
  
     private string? _name;
  
-    public override string? Name
-    {
+    public override string? Name {
         get => _name;
         set {
             _name = value;
@@ -1441,9 +1509,6 @@ public class HttpMessageInvoker : IDisposable
 }
 //-----------------------------Ʌ
 ```
-
-<----------------------!!!write down what will happen when you call using() on the client created by IHttpClientFactory, nothing happen
-
 
 References:
 
