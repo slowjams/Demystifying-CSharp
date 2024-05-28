@@ -39,7 +39,7 @@ public class HttpMessageInvoker : IDisposable
         {
             _disposed = true;
             if (_disposeHandler)  // <-------------pass false for IHttpClientFactory to manage disposing, so you can use `using` to dispose the HttpClient created from IHttpClientFactory
-            {                     // this ensures that disposing the HttpClient doesn't dispose the handler pipeline, as the IHttpClientFactory will handle that itself
+            {                     // this ensures that disposing the HttpClient doesn't dispose the handler pipeline, as the IHttpClientFactory will handle that itself, D1
                 _handler.Dispose();
             }
         }
@@ -75,7 +75,7 @@ public class Startup
     {     
         services
             .AddHttpClient<IBasketService, BasketService>(c => c.BaseAddress = new Uri(Configuration["ApiSettings:BasketUrl"]))
-            .AddHttpMessageHandler<LoggingDelegatingHandler>()
+            .AddHttpMessageHandler<LoggingDelegatingHandler>()  // no need to register LoggingDelegatingHandler, see R1
             .AddTransientHttpErrorPolicy(policy => policy.WaitAndRetryAsync(retryCount: 3, sleepDurationProvider: _ => TimeSpan.FromSeconds(2)))
             .AddTransientHttpErrorPolicy(policy => policy.CircuitBreakerAsync(5, TimeSpan.FromSeconds(30)));
 
@@ -86,9 +86,7 @@ public class Startup
 
 if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the HttpClientHandler which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
 
-By using `IHttpClientFactory`, it assigns an `HttpMessageHandler` from a pool to the HttpClient. `HttpClient` may (or may not) use an existing HttpClientHandler from the pool and therefore use an existing open connection.
-
-<----------------------!!!write down what will happen when you call using() on the client created by IHttpClientFactory, nothing happen
+By using `IHttpClientFactory`, it assigns an `HttpMessageHandler` from a pool to the HttpClient. `HttpClient` may (or may not) use an existing HttpClientHandler from the pool and therefore use an existing open connection. So when you call `using()` on the `HttpClient` created by `IHttpClientFactory`, nothing happen, see D1
 
 
 ## How to use HttpClient like IHttpClientFactory
@@ -163,7 +161,7 @@ So if you use a static `HttpClient` correctly with appropriate settings of `Pool
 > Even without the lifetime management piece, I expect to use the factory in my applications for some time to come. From discussions I’ve seen online, it’s quite possible that in future releases, the lifetime management functionality will be deprecated and/or removed from IHttpClientFactory, since the problem it was solving is no longer applicable.**
 
 
-## What Happen when you call Dispose on `HttpClient`
+## So What happen when you call Dispose on `HttpClient`
 
 Let's say you use a single static `HttpClient` to make multiple requests (different urls) then calls `Dispose`.
 
@@ -270,13 +268,156 @@ So how does it work internally?
 When using `IHttpClientFactory`, created `HttpClientHandler`/`SocketsHttpHandler` are wrapped in `LifetimeTrackingHttpMessageHandler` which has a default **2 mins** lifetime. New freseh created `LifetimeTrackingHttpMessageHandler` will be placed into ` _activeHandlers` and there is a Timer to check if the handler is expired, if it is, those handlers will be placed into 
 `_expiredHandlers` and there is another Timer that periodically does a check in **every 10 secs** to see if expired handlers can be disposed. The criteria to dispose a handler is to use `WeakReference` to see if the handler is being referenced (client2 in the above example)
 
-<-----------------add example of combining usage of setting SocketHandler and IHttpClientFactory with handler lifetime setting to Inifinitely
+
+## Using IHttpClientFactory together with SocketsHttpHandler
+
+The `SocketsHttpHandler` implementation of `HttpMessageHandler` was added in .NET Core 2.1, which allows `PooledConnectionLifetime` to be configured. This setting is used to ensure that the handler reacts to DNS changes, so using `SocketsHttpHandler` is considered to be an alternative to using `IHttpClientFactory`.
+
+However, `SocketsHttpHandler` and `IHttpClientFactory` can be used together improve configurability. By using both of these APIs, you benefit from configurability on both a low level (for example, using LocalCertificateSelectionCallback for dynamic certificate selection) and a high level (for example, leveraging DI integration and several client configurations).
+
+To use both APIs:
+
+1. Specify `SocketsHttpHandler` as `PrimaryHandler` and set up its `PooledConnectionLifetime` (for example, to a value that was previously in `HandlerLifetime`).
+2. As `SocketsHttpHandler` will handle connection pooling and recycling, then handler recycling at the `IHttpClientFactory` level is not needed anymore. You can disable it by setting `HandlerLifetime` to `Timeout.InfiniteTimeSpan`
+
+```C#
+services.AddHttpClient(name)
+    .ConfigurePrimaryHttpMessageHandler(() =>
+    {
+        return new SocketsHttpHandler()
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(2)
+        };
+    })
+    .SetHandlerLifetime(Timeout.InfiniteTimeSpan);  // <----------------disable rotation, as it is handled by PooledConnectionLifetime
+```
 
 
-<--------------add scopeAware example to explain why the httpcontext's scope is different than builder's own scope
-==========================aas================================================================================================
+## DI Scopes VS MessageHandler Scopes in IHttpClientFactory
 
-ggf
+```C#
+public class ScopedService
+{
+    public Guid InstanceId { get; } = Guid.NewGuid();
+}
+
+public class ScopedMessageHander: DelegatingHandler
+{
+    private readonly ILogger<ScopedMessageHander> _logger;
+    private readonly ScopedService _service;
+
+    public ScopedMessageHander(ILogger<ScopedMessageHander> logger, ScopedService service))
+    {
+        _logger = logger;
+        _service = service;
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        var instanceId = scopedService.InstanceId;
+        _logger.LogInformation("Service ID in handler: {InstanceId}", );
+
+        return base.SendAsync(request, cancellationToken);
+    }
+}
+
+public void ConfigureServices(IServiceCollection services)
+{
+    services.AddControllers();
+    services.AddScoped<ScopedService>();
+
+    services.AddHttpClient("test", client =>
+    {
+        client.BaseAddress = new Uri("https://jsonplaceholder.typicode.com");
+    })
+    .AddHttpMessageHandler<ScopedMessageHander>();
+
+    services.AddTransient<ScopedMessageHander>();
+}
+
+[ApiController]
+public class ValuesController : ControllerBase
+{
+    private readonly IHttpClientFactory _factory;
+    private readonly ScopedService _service;
+    private readonly ILogger<ValuesController> _logger;
+    public ValuesController(IHttpClientFactory factory, ScopedService service, ILogger<ValuesController> logger)
+    {
+        _factory = factory;
+        _service = service;
+        _logger = logger;
+    }
+
+    [HttpGet("values")]
+    public async Task<string> GetAsync()
+    {
+        // Get the scoped service's ID
+        var instanceId = _service.InstanceId
+        _logger.LogInformation("Service ID in controller {InstanceId}", instanceId);
+
+        // Retrieve an instance of the test client, and send a request
+        var client = _factory.CreateClient("test");
+        var result = await client.GetAsync("posts");
+
+        // Just return a response, we're not interested in this bit for now
+        result.EnsureSuccessStatusCode();
+        return await result.Content.ReadAsStringAsync();
+    }
+}
+
+/*  why scoped services is not scoped per request, check `DefaultHttpClientFactory` in D2 you will see
+
+info: Microsoft.Hosting.Lifetime[0]
+      Application started. Press Ctrl+C to shut down.
+
+# Request 1
+info: ScopedHandlers.Controllers.ValuesController[0]
+      Service ID in controller d553365d-2799-4618-ad3a-2a4b7dcbf15e
+info: ScopedHandlers.ScopedMessageHander[0]
+      Service ID in handler: 5c6b1b75-7f86-4c4f-9c90-23c6df65d6c6
+
+# Request 2
+info: ScopedHandlers.Controllers.ValuesController[0]
+      Service ID in controller af64338f-8e50-4a1f-b751-9f0be0bbad39
+info: ScopedHandlers.ScopedMessageHander[0]
+      Service ID in handler: 5c6b1b75-7f86-4c4f-9c90-23c6df65d6c
+*/
+```
+
+correct usage is to use `IHttpContextAccessor`
+
+```C#
+public class ScopedMessageHander: DelegatingHandler
+{
+    private readonly ILogger<ScopedMessageHander> _logger;
+    private readonly IHttpContextAccessor _accessor;
+
+    public ScopedMessageHander(ILogger<ScopedMessageHander> logger, IHttpContextAccessor accessor)
+    {
+        _logger = logger;
+        _accessor = accessor;
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        var httpConext = _accessor.HttpContext;
+
+        // retrieve the service from the Request DI Scope
+        var service = _accessor.HttpContext.RequestServices.GetRequiredService<ScopedService>();
+        
+        // The same scoped instance used in the controller
+        var instanceId = service.InstanceId;
+        _logger.LogInformation("Service ID in handler: {InstanceId}", );
+
+        return base.SendAsync(request, cancellationToken);
+    }
+}
+```
+
+There is also a more convoluted, complicated solution that overrides default `IHttpClientFactory` registration, check `ScopeAwareHttpClientFactory` at https://github.com/dotnet/docs/tree/main/docs/core/extensions/snippets/http/scopeworkaround
+
+
+
 # Source Code
 
 
@@ -295,7 +436,7 @@ public static partial class HttpClientBuilderExtensions
     { 
         builder.Services.Configure<HttpClientFactoryOptions>(builder.Name, options =>
         {
-            options.HttpMessageHandlerBuilderActions.Add(b => b.AdditionalHandlers.Add(b.Services.GetRequiredService<THandler>()));
+            options.HttpMessageHandlerBuilderActions.Add(b => b.AdditionalHandlers.Add(b.Services.GetRequiredService<THandler>()));  // <------R1
         });
  
         return builder;
@@ -1021,7 +1162,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         HttpClientFactoryOptions options = _optionsMonitor.Get(name);
         if (!options.SuppressHandlerScope)
         {
-            scope = _scopeFactory.CreateScope();  // <---------------------important!
+            scope = _scopeFactory.CreateScope();  // <---------------------important!, D2
             services = scope.ServiceProvider;
         }
  
@@ -1029,7 +1170,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         {
             // _scopeFactory.CreateScope() is used to create HttpMessageHandlerBuilder and this scope will be injected into HttpMessageHandlerBuilder's constructor,
             // this scope is different to HttpContext scope, which might cause issues if you don't use it properly
-            HttpMessageHandlerBuilder builder = services.GetRequiredService<HttpMessageHandlerBuilder>();  // <-------------------------
+            HttpMessageHandlerBuilder builder = services.GetRequiredService<HttpMessageHandlerBuilder>();  // <-------------------------D2
             builder.Name = name;
  
             Action<HttpMessageHandlerBuilder> configure = Configure;
@@ -1049,7 +1190,8 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
             {
                 for (int i = 0; i < options.HttpMessageHandlerBuilderActions.Count; i++)
                 {
-                    options.HttpMessageHandlerBuilderActions[i](b);  // <--------------important! HttpMessageHandlerBuilder's scope will be used to create DelegatingHandlers
+                    options.HttpMessageHandlerBuilderActions[i](b);  // <--------------D2, important! HttpMessageHandlerBuilder's scope will be used to create DelegatingHandlers
+                                                                     // that's when your custom DelegatingHandler get created
                 }
  
                 foreach (Action<HttpMessageHandlerBuilder> action in options.LoggingBuilderActions)
@@ -1140,13 +1282,11 @@ internal sealed class ActiveHandlerTrackingEntry
  
     public void StartExpiryTimer(TimerCallback callback)
     {
-        if (Lifetime == Timeout.InfiniteTimeSpan)
-        {
+        if (Lifetime == Timeout.InfiniteTimeSpan) {
                 return; // never expires.
         }
  
-        if (Volatile.Read(ref _timerInitialized))
-        {
+        if (Volatile.Read(ref _timerInitialized)) {
             return;
         }
  
@@ -1158,10 +1298,8 @@ internal sealed class ActiveHandlerTrackingEntry
         lock (_lock)
         {
             if (Volatile.Read(ref _timerInitialized))
-            {
                 return;
-            }
- 
+            
             _callback = callback;
             _timer = NonCapturingTimer.Create(_timerCallback, this, Lifetime, Timeout.InfiniteTimeSpan);
             _timerInitialized = true;
