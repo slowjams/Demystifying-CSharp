@@ -67,6 +67,14 @@ Action	                TCP connection behavior
 
 ## -----------------------------------------------------------------------------------------------------------------------
 ```C#
+var handler = new SocketsHttpHandler
+{
+    // ...
+};
+
+var client = new HttpClient(handler);
+
+
 //-----------------------------V
 public partial class HttpClient : HttpMessageInvoker  // HttpMessageInvoker implements IDisposable, so when you call `Dispose` (use using block) on `HttpClient`
 {                                                     // the underlying TCP connection goes to TIME_WAIT state immediately
@@ -476,13 +484,238 @@ There is also a more convoluted, complicated solution that overrides default `IH
 
 ## Request Pipeline
 
+see hc section for details:
+
+`MyDelegatingHandler.SendAsync()`
+            │
+            ▼
+`HttpClient.GetStringAsyncCore()`
+            │
+            ▼
+`HttpClientHandler.SendAsync()`
+            │
+            ▼
+`SocketsHttpHandler.SendAsync()` starts ─► `MetricsHandler.SendAsync()` ─► `DiagnosticsHandler.SendAsync()` ─► `HttpConnectionHandler.SendAsync()` ─► `HttpConnectionPoolManager.SendAsync()` ─► `HttpConnectionPool.SendAsync()` ─► `Http2Connection.SendAsync()` ─► `SocketsHttpHandler.SendAsync()` ends
 
 
+```C#
+/*
+note that the design of `HttpMessageHandler` is to use `DelegatingHandler` so that `DefaultHttpMessageHandlerBuilder` can create `HttpMessageHandler PrimaryHandler = new HttpClientHandler()` and this `HttpClientHandler:HttpMessageHandler` is assigned to `DelegatingHandler.InnerHandler`, see ihc section
+*/
+
+while `HttpMessageHandlerStage` is for another pipeline in `SocketsHttpHandler` only
+//-------------------------------------V
+public abstract class DelegatingHandler : HttpMessageHandler
+{
+    private HttpMessageHandler? _innerHandler;
+    // ...
+
+    protected DelegatingHandler() { }
+
+    protected DelegatingHandler(HttpMessageHandler innerHandler)
+    {
+        InnerHandler = innerHandler;
+    }
+
+    public HttpMessageHandler? InnerHandler => _innerHandler;
+    
+    protected internal override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    { 
+        return _innerHandler!.SendAsync(request, cancellationToken);
+    }
+}
+//-------------------------------------Ʌ
 
 
+```C#
+/*
+var socketsHandler = new SocketsHttpHandler
+{
+    PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+    MaxConnectionsPerServer = 10
+};
+*/
 
+// alternative: var client = new HttpClient(socketsHandler); 
+var client = new HttpClient();  // not reflected in this code but say you use a custom DelegatingHandler called MyDelegatingHandler via 
+                                // services.AddHttpClient(..).AddHttpMessageHandler<MyDelegatingHandler>() 
 
-=================================================================================================================================================================================
+var result = client.GetAsync("https://www.google.com");
+```
+
+```C#
+//-----------------------------V
+public partial class HttpClient : HttpMessageInvoker  
+{                                                     
+    
+    public HttpClient() : this(new HttpClientHandler()) { };   // <-------------hc1.0
+    public HttpClient(HttpMessageHandler handler) : this(handler, true) { }
+    public HttpClient(HttpMessageHandler handler, bool disposeHandler) : base(handler, disposeHandler){ }  // <-------------hc1.1
+
+    public Task<string> GetStringAsync(Uri? requestUri, CancellationToken cancellationToken)
+    {
+        HttpRequestMessage request = CreateRequestMessage(HttpMethod.Get, requestUri);
+        
+        return GetStringAsyncCore(request, cancellationToken);     
+    }
+
+    private async Task<string> GetStringAsyncCore(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        // ...
+        response = await base.SendAsync(request, cts.Token).ConfigureAwait(false);  // <-------------hc1.2.
+        // ...
+    }
+    // ...
+}
+//-----------------------------Ʌ
+
+//-----------------------------V
+public class HttpMessageInvoker : IDisposable
+{
+    private readonly bool _disposeHandler;
+    private readonly HttpMessageHandler _handler;  // <-------------hc1.1   new HttpClientHandler() is passed to here
+ 
+    public HttpMessageInvoker(HttpMessageHandler handler) : this(handler, true) { }
+
+    public HttpMessageInvoker(HttpMessageHandler handler, bool disposeHandler)
+    { 
+        _handler = handler;
+        _disposeHandler = disposeHandler;
+    }
+    
+    public virtual Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        // ...
+        _handler.SendAsync(request, cancellationToken);  // <-------------------------hc2.1, call HttpClientHandler.SendAsync()
+        // ...
+    }
+}
+//-----------------------------Ʌ
+
+//--------------------------------------V
+public abstract class HttpMessageHandler : IDisposable
+{
+    protected HttpMessageHandler() { }
+
+    protected internal abstract Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken);
+
+    // ...
+}
+//--------------------------------------Ʌ
+
+//------------------------------------V
+public partial class HttpClientHandler : HttpMessageHandler
+{
+    private readonly SocketsHttpHandler _underlyingHandler;
+ 
+    public HttpClientHandler()
+    {
+        _underlyingHandler = new SocketsHttpHandler();  // <----------------------------!
+    }
+
+    private HttpMessageHandler Handler => _underlyingHandler;
+
+    public bool UseCookies
+    {
+        get => _underlyingHandler.UseCookies;
+        set => _underlyingHandler.UseCookies = value;
+    }
+
+    // ...
+
+    protected internal override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        return Handler.SendAsync(request, cancellationToken);   // <-------------------------hc2.2. call SocketsHttpHandler.SendAsync()
+    }
+}
+//------------------------------------Ʌ
+
+//------------------------------------V
+public sealed class SocketsHttpHandler : HttpMessageHandler 
+{
+    private readonly HttpConnectionSettings _settings = new HttpConnectionSettings();
+    private HttpMessageHandlerStage? _handler;
+
+    public bool UseCookies  { get; set; }     // on _settings._useCookies
+    public TimeSpan PooledConnectionLifetime { get; set; }     // on _settings._pooledConnectionLifetime
+    public TimeSpan PooledConnectionIdleTimeout { get; set; }  // on _settings._pooledConnectionIdleTimeout
+   
+    // ...
+
+    private HttpMessageHandlerStage SetupHandlerChain()  // <----------------------hc3.2
+    {
+        HttpConnectionSettings settings = _settings.CloneAndNormalize();
+ 
+        HttpConnectionPoolManager poolManager = new HttpConnectionPoolManager(settings);  // <----------------------hc3.3
+ 
+        HttpMessageHandlerStage handler;
+ 
+        if (settings._credentials == null)
+        {
+            handler = new HttpConnectionHandler(poolManager);  // <----------------------hc3.4
+        }
+        else
+        {
+            handler = new HttpAuthenticatedConnectionHandler(poolManager);
+        }
+
+        // DiagnosticsHandler is inserted before RedirectHandler so that trace propagation is done on redirects as well
+        if (DiagnosticsHandler.IsGloballyEnabled() && settings._activityHeadersPropagator is DistributedContextPropagator propagator)
+        {
+            handler = new DiagnosticsHandler(handler, propagator, settings._allowAutoRedirect);  // <----------------------hc3.5
+        }
+ 
+        handler = new MetricsHandler(handler, settings._meterFactory, out Meter meter);  // <----------------------hc3.6
+ 
+        // ...
+
+        return _handler;
+    }
+
+    protected internal override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)  // <----------------------hc3.1
+    { 
+        HttpMessageHandlerStage handler = _handler ?? SetupHandlerChain();  // <----------------------hc3.2
+ 
+        return handler.SendAsync(request, cancellationToken);   // <----------------------hc3.7.
+    }
+}
+//------------------------------------Ʌ
+
+//---------------------------------------------V
+internal abstract class HttpMessageHandlerStage : HttpMessageHandler
+{
+    protected internal sealed override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        ValueTask<HttpResponseMessage> sendTask = SendAsync(request, async: false, cancellationToken);
+        
+        return sendTask.IsCompleted ? sendTask.Result : sendTask.AsTask().GetAwaiter().GetResult();
+    }
+
+    internal abstract ValueTask<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, CancellationToken cancellationToken);  
+}
+//---------------------------------------------Ʌ
+
+//-----------------------------------------V
+internal sealed class HttpConnectionHandler : HttpMessageHandlerStage
+{
+    private readonly HttpConnectionPoolManager _poolManager;
+
+    public HttpConnectionHandler(HttpConnectionPoolManager poolManager)
+    {
+        _poolManager = poolManager;
+    }
+
+    internal override ValueTask<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, CancellationToken cancellationToken)  // <----------------------hc4.1
+    {
+        return _poolManager.SendAsync(request, async, doRequestAuth: false, cancellationToken);   // <----------------------hc4.2.
+    }
+}
+//-----------------------------------------Ʌ
+```
+
+## ================================================================================================================================================================================
+
 
 # Source Code
 
@@ -942,7 +1175,7 @@ internal sealed class HttpConnectionPoolManager : IDisposable
         // ...
     }
     // ...
-    public ValueTask<HttpResponseMessage> SendAsyncCore(HttpRequestMessage request, Uri? proxyUri, bool async, bool doRequestAuth, bool isProxyConnect, CancellationToken cancellationToken)
+    public ValueTask<HttpResponseMessage> SendAsyncCore(HttpRequestMessage request, Uri? proxyUri, bool async, bool doRequestAuth, bool isProxyConnect, CancellationToken cancellationToken)   // <----------------------hc5.1
     {
         HttpConnectionKey key = GetConnectionKey(request, proxyUri, isProxyConnect);
  
@@ -975,7 +1208,7 @@ internal sealed class HttpConnectionPoolManager : IDisposable
             // as that's only needed when it contains connections that need to be closed.
         }
  
-        return pool.SendAsync(request, async, doRequestAuth, cancellationToken);
+        return pool.SendAsync(request, async, doRequestAuth, cancellationToken);   // <----------------------hc5.2.
     }
 
     public ValueTask<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, bool doRequestAuth, CancellationToken cancellationToken)
@@ -1039,11 +1272,11 @@ internal sealed partial class HttpConnectionPool : IDisposable  // provides a po
 
     public HttpConnectionPool(HttpConnectionPoolManager poolManager, HttpConnectionKind kind, string? host, int port, string? sslHostName, Uri? proxyUri);
 
-    public ValueTask<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, bool doRequestAuth, CancellationToken cancellationToken)
+    public ValueTask<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, bool doRequestAuth, CancellationToken cancellationToken)  // <---------------hc6.1
     {
         // ...
         return SendWithProxyAuthAsync(request, async, doRequestAuth, cancellationToken);   // eventually calls Http2Connection.SendAsync()
-
+                                                                                           // <---------------hc6.2
         //
     }
 }
@@ -1077,7 +1310,7 @@ internal sealed partial class Http2Connection : HttpConnectionBase  // large cla
         _keepAlivePingPolicy = _pool.Settings._keepAlivePingPolicy;
     }
 
-    public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, CancellationToken cancellationToken)
+    public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, bool async, CancellationToken cancellationToken)  // <---------------hc7.
     {
         // ...
     }
@@ -1427,7 +1660,7 @@ public abstract class HttpMessageHandlerBuilder
 
     public abstract HttpMessageHandler Build();
 
-    protected internal static HttpMessageHandler CreateHandlerPipeline(HttpMessageHandler primaryHandler, IEnumerable<DelegatingHandler> additionalHandlers)
+    protected internal static HttpMessageHandler CreateHandlerPipeline(HttpMessageHandler primaryHandler, IEnumerable<DelegatingHandler> additionalHandlers) // <-----------ihc
     {
         IReadOnlyList<DelegatingHandler> additionalHandlersList = additionalHandlers as IReadOnlyList<DelegatingHandler> ?? additionalHandlers.ToArray();
  
@@ -1447,7 +1680,7 @@ public abstract class HttpMessageHandlerBuilder
                 throw new InvalidOperationException("...");
             }
  
-            handler.InnerHandler = next;
+            handler.InnerHandler = next;   // <----------------ihc
             next = handler;
         }
  
@@ -1473,7 +1706,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
         }
     }
 
-    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler();  // <------------------- use SocketsHttpHandler
+    public override HttpMessageHandler PrimaryHandler { get; set; } = new HttpClientHandler();  // <------------------- use SocketsHttpHandler, ihc
 
     public override IList<DelegatingHandler> AdditionalHandlers { get; } = new List<DelegatingHandler>();
  
@@ -1486,7 +1719,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
             throw new InvalidOperationException("...");
         }
  
-        return CreateHandlerPipeline(PrimaryHandler, AdditionalHandlers);
+        return CreateHandlerPipeline(PrimaryHandler, AdditionalHandlers);    // <---------------------ihc
     }
 }
 //----------------------------------------------------Ʌ
