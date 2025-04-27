@@ -1,6 +1,71 @@
 ## Demystifying HttpClientFactory
 
+Prerequisites:
 
+https://organicprogrammer.com/2018/12/14/why-tcp-four-way-handshake/ and https://organicprogrammer.com/2021/10/25/understand-http1-1-persistent-connection-golang/
+when Client receives FIN from ther server, it doesn't go to "Closed" state immediately but goes into `TIME-WAIT` (2 Maximum Segment Lifetime, nomrally 120s), because the client needs to give enough time to resend ACK to server (in case the last ACK is missing, and server will resend FIN to client so that client can resend ACK again). If there is no `TIME-WAIT` state and client goes to "Close" immediately, which releases the port number back to OS and OS might assign the port to another connection (for same client who sends parallel or rapid requstss), which "pollute" the new requests.
+While theoretically, there could still be a risk if the final ACK is lost and the client moves to a new connection without giving the system time to clean up, TCP’s design with TIME-WAIT, sequence number checks minimizes this risk significantly.
+
+When you call `HttpClient.Dispose()`, its underlying `SocketsHttpHandler` is also disposed, all the connections managed by the SocketsHttpHandler will be closed. This includes all connections in the connection pool, and they will transition to the TIME_WAIT state, see ## So "What happen when you call Dispose on `HttpClient`" section for details and why it is badto call  `HttpClient.Dispose()`
+
+
+For client to explicitly tell server to close connection and do not reuse connection for client itself, client needs to send `Connection: close header` header
+```C#
+var client = new HttpClient();
+var request = new HttpRequestMessage(HttpMethod.Get, "https://example.com");
+
+// Explicitly add the Connection: close header
+request.Headers.ConnectionClose = true;  // <---------------this is what makes Kestrel closes connection (Kestrel will send FIN to this client)
+
+var response = await client.SendAsync(request);
+```
+note that client doesn't need server to send Connection: close header to itself, after reading the response, it will close the connection via `SocketsHttpHandler` -> 
+
+In Summary, if you new up a HttpClient instance and used it but never dispose it manually,  `TIME_WAIT` Occur when 
+* The connection exceeds the `PooledConnectionIdleTimeout` (default is **1** min, used by `SocketsHttpHandler`).
+* The connection exceeds the `PooledConnectionLifetime`(default is **infinite**, used by `SocketsHttpHandler`).
+* The HttpClient or its underlying `SocketsHttpHandler` is disposed.
+
+The `SocketsHttpHandler` instance can pool mulitple connections based on destination endpoints i.e host and port (of course if the source ip and port number are different to the exisiting pool connection, the pooled connection cannot be reused, but it is rare case that source ip and port will change)
+
+Also note that Maximum Segment Lifetime has nothing to do with PooledConnectionLifetime, the former is for low level TCP stack, can only be configured by OS, the latter is for high level SocketsHttpHandler. So if you set PooledConnectionLifetime to 10s, the after 10s, the SocketsHttpHandler "moves" underlying TCP connection to `TIME-WAIT`, then after 2 * Maximum Segment Lifetime, this connection goes to "closed" state.
+
+
+## How SocketsHttpHandler Pools Connections
+
+`SocketsHttpHandler` pools connections based on a "connection key" — and that key depends mainly on:
+* Destination host (foo.com/post/1 and foo.com/post/2 are considered as same host)
+* Destination port
+
+note that it doesn't depend on source ip and source port, you might also ask what if there are mutlple requests of same destination (e.g "https://example.com") and we use a singleton HttpClient and there are multiple controllers which sends the reqeusts to same destination, then how does `SocketsHttpHandler` distinguishs different requests and don't mix up with resonse for each request?
+
+The answer is, for source ip, there won't be different source ip in a singe application codebase so let's don't worry about it. What about source port, there is certainly chances that a client can pick up different port for same destination request.
+To answer it, source port is chosen by OS, and `SocketsHttpHandler` handles the low-level TCP connection creations, so once SocketsHttpHandler see the a new request is sent to same Destination, it won't ask OS to use a new random port but using an exising resuable connection's port in the pool, that's why we have to use `await client.SendAsync(request)` to make sure each request completes before a new request is sent, and all this resuable connections based on the foundation of HTTP/1.1, persistent connections (also called keep-alive),
+which is a default behavior in HTTP/1.1, to explicit close connections, one side sends `Connection: close` header explicitly to express the intention of close the underlying TCP connection. However in HTTP/1.1 protocol, concurrent requests will establish multiple TCP connections. That’s the restriction of HTTP/1.1, the way to enhance it is using HTTP/2 which can multiplex one TCP connection for multiple parallel HTTP connections. HTTP/2 is not in the scope of this post
+
+interestly, parallel requests might still reuse TCP connection in HTTP/1.1 with `MaxConnectionsPerServer` setting. Imagine you have 3 concurrent requests to api.example.com and you set:
+```C#
+var handler = new SocketsHttpHandler
+{
+    MaxConnectionsPerServer = 2  // default is int.MaxValue
+};
+
+var client = new HttpClient(handler);
+
+await Task.WhenAll(
+    client.GetAsync("https://api.example.com"),
+    client.GetAsync("https://api.example.com"),
+    client.GetAsync("https://api.example.com")
+);
+```
+Action	                TCP connection behavior
+1st request sent	    Open a new connection (source port: 12345)
+2nd request sent	    Open another new connection (source port: 12346)
+3rd request sent	    Wait — queued, because MaxConnectionsPerServer = 2
+1st request finishes	The 3rd request can now reuse one of the 2 connections, the port will be the same as the resued one, it is SocketsHttpHandler that decides to resue port
+
+
+## -----------------------------------------------------------------------------------------------------------------------
 ```C#
 //-----------------------------V
 public partial class HttpClient : HttpMessageInvoker  // HttpMessageInvoker implements IDisposable, so when you call `Dispose` (use using block) on `HttpClient`
@@ -84,7 +149,7 @@ public class Startup
 }
 ```
 
-if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the HttpClientHandler which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
+if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the `HttpClientHandler` which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
 
 By using `IHttpClientFactory`, it assigns an `HttpMessageHandler` from a pool to the HttpClient. `HttpClient` may (or may not) use an existing HttpClientHandler from the pool and therefore use an existing open connection. So when you call `using()` on the `HttpClient` created by `IHttpClientFactory`, nothing happen, see D1
 
@@ -126,14 +191,6 @@ TCP   192.168.1.139:53118   216.58.211.164:443   TIME_WAIT     0
 TCP   192.168.1.139:53120   216.58.211.164:443   TIME_WAIT     0
 TCP   192.168.1.139:53121   216.58.211.164:443   TIME_WAIT     0
 */
-
-public partial class HttpClient : HttpMessageInvoker
-{
-    // ...
-    public HttpClient() : this(new HttpClientHandler()) { }  
-
-    public HttpClient(HttpMessageHandler handler) : this(handler, true) { }
-}
 ```
 
 note that if you don't re-use `HttpClient`, says you create another one
@@ -152,7 +209,7 @@ await client.GetAsync("https://www.google.com");
 
 So if you use a static `HttpClient` correctly with appropriate settings of `PooledConnectionLifetime` and `PooledConnectionIdleTimeout`, you can achieve the same effects as `IHttpClientFactory`, so "DO I STILL NEED IHTTPCLIENTFACTORY?" from https://www.stevejgordon.co.uk/httpclient-connection-pooling-in-dotnet-core
 
-> This is a very logical question which may arise as the result of this post. One of the features of IHttpClientFactory is the lifetime management of HttpMessageHandler chains and as a result, also of the underlying connections. Armed with the knowledge that HttpClient and SocketsHttpHandler can achieve the same effect, do we need to bother with IHttpClientFactory?
+> This is a very logical question which may arise as the result of this post. One of the features of IHttpClientFactory is the lifetime management of `HttpMessageHandler` chains and as a result, also of the underlying connections. Armed with the knowledge that HttpClient and SocketsHttpHandler can achieve the same effect, do we need to bother with IHttpClientFactory?
 
 > My view is that IHttpClientFactory has other benefits beyond helping manage connection lifetimes and still adds value when making outbound HTTP requests. It provides a great pattern to define logical configurations for HttpClient instances using the named or typed client approaches. The later, typed clients is a personal favourite of mine.
 
@@ -165,10 +222,10 @@ So if you use a static `HttpClient` correctly with appropriate settings of `Pool
 
 Let's say you use a single static `HttpClient` to make multiple requests (different urls) then calls `Dispose`.
 
-What happen is the underlying `HttpMessageHandler`/`SocketsHttpHandler` is disposed. `SocketsHttpHandler` uses `HttpConnectionPoolManager` to manage `HttpConnectionPool` which contains multiple TCP connections (for different url). When it is disposed, all underlying TCP connections will be closed (moved to `Time_WAIT`), so you cannot re-use any more TCP connection.  So one of recommended ways to use `HttpClient` is do not call `Dispose` on it
+What happen is the underlying `HttpMessageHandler`/`SocketsHttpHandler` is disposed. `SocketsHttpHandler` uses `HttpConnectionPoolManager` to manage `HttpConnectionPool` which contains multiple TCP connections (for different url). When it is disposed, all underlying TCP connections will be closed (moved to `Time_WAIT`), so you cannot re-use any more TCP connection.  **So one of recommended ways to use `HttpClient` is do not call `Dispose` on it** (because the singleton `HttpClient` instance might have "cached" some existing requests for reuse, if you call Dispose, it reset all the "cache/mapping")
 
 
-## What's the difference between HttpClient's PooledConnectionLifetime and IHttpClientFactory's SetHandlerLifetime?
+## Important! What's the difference between SocketsHttpHandler's PooledConnectionLifetime and IHttpClientFactory's SetHandlerLifetime?
 
 `HttpClient`:
 
@@ -196,7 +253,7 @@ TCP   192.168.1.37:51903   216.58.211.164:443   ESTABLISHED
 */
 
 /* when you make requests after 10 secs 
-TCP   192.168.1.37:51903   216.58.211.164:443   TIME_WAIT 
+TCP   192.168.1.37:51903   216.58.211.164:443   TIME_WAIT     
 TCP   192.168.1.37:51904   216.58.211.164:443   ESTABLISHED   <----------a new TCP connection is created as the one connection above cannot be reused anymore
 */
 ```
@@ -244,29 +301,27 @@ public class OtherController : ControllerBase
     [HttpGet()]
     public async Task<ActionResult> Get()
     {
-        var client2 = _factory.CreateClient("typicode");
+        var client2 = _factory.CreateClient("typicode");         // client1 and client2 share the same underlying `HttpMessageHandler`/ `SocketsHttpHandler`
                                                                  // <-----------------------------------------moment X
         var response = await client2.GetAsync("posts/1/comments");
         // ...     
     }
 }
 
-/* when you make a lot of requests in 10 secs
+/* when you make a lot of requests within 10 secs
 TCP   192.168.1.37:51903   216.58.211.164:443   ESTABLISHED 
 */
 
 /* when you make requests after 10 secs 
-TCP   192.168.1.37:51903   216.58.211.164:443   ESTABLISHED   <----------unlike HttpClient example above which goes to TIME_WAIT, the "expired connection is not closed immediately
-TCP   192.168.1.37:51904   216.58.211.164:443   ESTABLISHED   <----------a new TCP connection
-
+TCP   192.168.1.37:51903   216.58.211.164:443   ESTABLISHED   <-------unlike HttpClient example above which goes to TIME_WAIT, the "expired connection is not closed immediately
+TCP   192.168.1.37:51904   216.58.211.164:443   ESTABLISHED   <---- --a new TCP connection is created, since expired hander above is removed from _activeHandlers,see ah
 */
 ```
-so why the connection doesn't goes to `TIME_WAIT` and still in `ESTABLISHED` state? This is because there could be other requests (OtherController) that already holds a reference to a `HttpClient` created by `IHttpClientFactory.CreateClient()` at moment X (before making an actual request), therefore the TCP connection still stays `ESTABLISHED`, which is different than IHttpClient's PooledConnectionLifetime, that's why it is called "HandlerLifeTime" in `SetHandlerLifetime` against "ConnectionLifetime" in `PooledConnectionLifetime`
+so why the connection doesn't goes to `TIME_WAIT` and still in `ESTABLISHED` state? This is because there could be other requests (OtherController) that already holds a reference to a `HttpClient` created by `IHttpClientFactory.CreateClient()` at moment X (before making an actual request), therefore the TCP connection still stays `ESTABLISHED`, which is different than `SocketsHttpHandler`'s `PooledConnectionLifetime`, that's why it is called "HandlerLifeTime" in `SetHandlerLifetime` against "ConnectionLifetime" in `PooledConnectionLifetime`. Also note that `SetHandlerLifetime` is for "handler level", once the handler lifetime exceeds, all the connectionss in the pool are "reset" and cannot be reused, while for `SocketsHttpHandler`, when `PooledConnectionLifetime` exceeds, only connections who exceeds PooledConnectionLifetime get reset, image two requests, rA to foo.com and rB to bar.com, r1 was pooled at 17:05 and r2 was pooled as 17:09, if PooledConnectionLifetime is 5min, r1 was removed from the pool at 17:10 while r2 still be pooled and can be reused until 17:14
 
 So how does it work internally?
 
-When using `IHttpClientFactory`, created `HttpClientHandler`/`SocketsHttpHandler` are wrapped in `LifetimeTrackingHttpMessageHandler` which has a default **2 mins** lifetime. New freseh created `LifetimeTrackingHttpMessageHandler` will be placed into ` _activeHandlers` and there is a Timer to check if the handler is expired, if it is, those handlers will be placed into 
-`_expiredHandlers` and there is another Timer that periodically does a check in **every 10 secs** to see if expired handlers can be disposed. The criteria to dispose a handler is to use `WeakReference` to see if the handler is being referenced (client2 in the above example)
+When using `IHttpClientFactory.CreateClient("clientName")`in different place, a shared `HttpMessageHandler`/ `SocketsHttpHandler` will be used. Created `HttpClientHandler`/`SocketsHttpHandler` are wrapped in `LifetimeTrackingHttpMessageHandler` which has a default **2 mins** lifetime. New freseh created `LifetimeTrackingHttpMessageHandler` will be placed into `_activeHandlers` and there is a Timer to check if the handler is expired, if it is, those handlers will be placed into `_expiredHandlers` and there is another Timer that periodically does a check in **every 10 secs** (see `DefaultCleanupInterval` in ci) to see if expired handlers can be disposed. The criteria to dispose a handler is to use `WeakReference` to see if the handler is being referenced (client2 in the above example)
 
 
 ## Using IHttpClientFactory together with SocketsHttpHandler
@@ -291,6 +346,7 @@ services.AddHttpClient(name)
     })
     .SetHandlerLifetime(Timeout.InfiniteTimeSpan);  // <----------------disable rotation, as it is handled by PooledConnectionLifetime
 ```
+ Since `SocketsHttpHandler` will handle connection pooling and recycling, handler recycling at the `IHttpClientFactory` level is no longer needed. You can disable it by setting `HandlerLifetime` to `Timeout.InfiniteTimeSpan`, see  Since SocketsHttpHandler will handle connection pooling and recycling, handler recycling at the IHttpClientFactory level is no longer needed. You can disable it by setting HandlerLifetime to Timeout.InfiniteTimeSpan
 
 
 ## DI Scopes VS MessageHandler Scopes in IHttpClientFactory
@@ -418,6 +474,16 @@ There is also a more convoluted, complicated solution that overrides default `IH
 
 
 
+## Request Pipeline
+
+
+
+
+
+
+
+=================================================================================================================================================================================
+
 # Source Code
 
 
@@ -436,6 +502,7 @@ public static partial class HttpClientBuilderExtensions
     { 
         builder.Services.Configure<HttpClientFactoryOptions>(builder.Name, options =>
         {
+                                                      // b is HttpMessageHandlerBuilder
             options.HttpMessageHandlerBuilderActions.Add(b => b.AdditionalHandlers.Add(b.Services.GetRequiredService<THandler>()));  // <------R1
         });
  
@@ -512,6 +579,22 @@ public static partial class HttpClientBuilderExtensions
             registry.NamedClientRegistrations[name] = type;
         }
     }
+}
+
+internal sealed class DefaultHttpClientBuilder : IHttpClientBuilder
+{
+    public DefaultHttpClientBuilder(IServiceCollection services, string name)
+    {
+        // The tracker references a descriptor. It marks the position of where default services are added to the collection.
+        var tracker = (DefaultHttpClientConfigurationTracker?)services.Single(sd => sd.ServiceType == typeof(DefaultHttpClientConfigurationTracker)).ImplementationInstance;
+ 
+        Services = new DefaultHttpClientBuilderServiceCollection(services, name == null, tracker);
+        Name = name!;
+    }
+ 
+    public string Name { get; }
+ 
+    public IServiceCollection Services { get; }
 }
 ```
 
@@ -608,7 +691,7 @@ public partial class HttpClientHandler : HttpMessageHandler
  
     public HttpClientHandler()
     {
-        _underlyingHandler = new SocketsHttpHandler();  // <-----------------------------------
+        _underlyingHandler = new SocketsHttpHandler();  // <-----------------------------------!
  
         ClientCertificateOptions = ClientCertificateOption.Manual;
     }
@@ -866,7 +949,7 @@ internal sealed class HttpConnectionPoolManager : IDisposable
         HttpConnectionPool? pool;
         while (!_pools.TryGetValue(key, out pool))
         {
-            pool = new HttpConnectionPool(this, key.Kind, key.Host, key.Port, key.SslHostName, key.ProxyUri);
+            pool = new HttpConnectionPool(this, key.Kind, key.Host, key.Port, key.SslHostName, key.ProxyUri);  // <----------------------
  
             if (_cleaningTimer == null)
             {
@@ -1020,7 +1103,7 @@ public static class HttpClientFactoryServiceCollectionExtensions
         services.AddOptions();
         services.AddMetrics();
  
-        services.TryAddTransient<HttpMessageHandlerBuilder, DefaultHttpMessageHandlerBuilder>();
+        services.TryAddTransient<HttpMessageHandlerBuilder, DefaultHttpMessageHandlerBuilder>();  // <-----------------this line enables usage of DelegatingHandler
         services.TryAddSingleton<DefaultHttpClientFactory>();
         services.TryAddSingleton<IHttpClientFactory>(serviceProvider => serviceProvider.GetRequiredService<DefaultHttpClientFactory>());
 
@@ -1082,7 +1165,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
  
     // default time of 10s for cleanup seems reasonable. Quick math: 
     // 10 distinct named clients * expiry time >= 1s = approximate cleanup queue of 100 items, this seems frequent enough
-    private readonly TimeSpan DefaultCleanupInterval = TimeSpan.FromSeconds(10);
+    private readonly TimeSpan DefaultCleanupInterval = TimeSpan.FromSeconds(10);  // <---------------------------------------ci
  
     private Timer? _cleanupTimer;
     private readonly object _cleanupTimerLock;
@@ -1213,7 +1296,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         var active = (ActiveHandlerTrackingEntry)state!;
  
         // the timer callback should be the only one removing from the active collection. If we can't find  our entry in the collection, then this is a bug.
-        bool removed = _activeHandlers.TryRemove(active.Name, out Lazy<ActiveHandlerTrackingEntry>? found);
+        bool removed = _activeHandlers.TryRemove(active.Name, out Lazy<ActiveHandlerTrackingEntry>? found);  // <------------------------ah
  
         // at this point the handler is no longer 'active' and will not be handed out to any new clients. However we haven't dropped our strong reference to the handler,
         // so we can't yet determine if  there are still any other outstanding references (we know there is at least one).
@@ -1413,7 +1496,7 @@ public class HttpClientFactoryOptions
 {
     internal static readonly TimeSpan MinimumHandlerLifetime = TimeSpan.FromSeconds(1);
  
-    private TimeSpan _handlerLifetime = TimeSpan.FromMinutes(2);  // <-------------------------------
+    private TimeSpan _handlerLifetime = TimeSpan.FromMinutes(2);  // <------------ default handler lifetime for IHttpClientFactory is 2 minutes
 
     public IList<Action<HttpMessageHandlerBuilder>> HttpMessageHandlerBuilderActions { get; } = new List<Action<HttpMessageHandlerBuilder>>();
 
@@ -1646,17 +1729,41 @@ public class HttpMessageInvoker : IDisposable
     // ...
 }
 //-----------------------------Ʌ
+
+//-----------------------------------------------V
+internal static partial class HttpHandlerDefaults
+{
+    public const int DefaultMaxAutomaticRedirections = 50;
+    public const int DefaultMaxResponseDrainSize = 1024 * 1024;
+    public static readonly TimeSpan DefaultResponseDrainTimeout = TimeSpan.FromSeconds(2);
+    public const int DefaultMaxResponseHeadersLength = 64; // Units in K (1024) bytes.
+    public const DecompressionMethods DefaultAutomaticDecompression = DecompressionMethods.None;
+    public const bool DefaultAutomaticRedirection = true;
+    public const bool DefaultUseCookies = true;
+    public const bool DefaultPreAuthenticate = false;
+    public const ClientCertificateOption DefaultClientCertificateOption = ClientCertificateOption.Manual;
+    public const bool DefaultUseProxy = true;
+    public const bool DefaultUseDefaultCredentials = false;
+    public const bool DefaultCheckCertificateRevocationList = false;
+    public const TokenImpersonationLevel DefaultImpersonationLevel = TokenImpersonationLevel.None;
+    public static readonly TimeSpan DefaultPooledConnectionLifetime = Timeout.InfiniteTimeSpan;
+    public static readonly TimeSpan DefaultPooledConnectionIdleTimeout = TimeSpan.FromMinutes(1);
+    public static readonly TimeSpan DefaultExpect100ContinueTimeout = TimeSpan.FromSeconds(1);
+    public static readonly TimeSpan DefaultConnectTimeout = Timeout.InfiniteTimeSpan;
+}
+//-----------------------------------------------Ʌ
 ```
 
 References:
 
-
-https://blog.davidvassallo.me/2010/07/13/time_wait-and-port-reuse/
+https://organicprogrammer.com/2018/12/14/why-tcp-four-way-handshake/
+https://organicprogrammer.com/2021/10/25/understand-http1-1-persistent-connection-golang/
 https://www.mytechramblings.com/posts/dotnet-httpclient-basic-usage-scenarios/#:~:text=Once%20this%20lifetime%20expires%2C%20the,and%20removed%20from%20the%20pool.
+https://byterot.blogspot.com/2016/07/singleton-httpclient-dns.html
+https://blog.davidvassallo.me/2010/07/13/time_wait-and-port-reuse/
 https://medium.com/@nuno.caneco/c-httpclient-should-not-be-disposed-or-should-it-45d2a8f568bc
 https://www.stevejgordon.co.uk/httpclient-connection-pooling-in-dotnet-core
 https://andrewlock.net/exporing-the-code-behind-ihttpclientfactory/
 https://www.meziantou.net/avoid-dns-issues-with-httpclient-in-dotnet.htm
 https://www.stevejgordon.co.uk/introduction-to-httpclientfactory-aspnetcore
-https://medium.com/@organicprogrammer/why-tcp-connection-termination-needs-four-way-handshake-90d68bb82816
 https://learn.microsoft.com/en-us/dotnet/architecture/microservices/implement-resilient-applications/use-httpclientfactory-to-implement-resilient-http-requests

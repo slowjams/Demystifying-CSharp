@@ -127,6 +127,12 @@ ParentSpanId 72dc8c0dc24fc406
 
 ## OpenTelemetry
 
+The word "telemetry" originates from the Greek roots "tele" meaning "remote" or "far," and "metron," meaning "measure". Oxford Advanced Learner's Dictionary defines *Telemetry* as: the process of using special equipment to send, receive and measure scientific data over long distances
+
+`Telemetry` in .NET refers to the process of collecting and analyzing data about an application's behavior and performance.
+
+
+
 ```C#
 public static class Sdk
 {

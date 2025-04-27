@@ -1,214 +1,3 @@
-## Demystifying HttpClientFactory
-
-
-```C#
-public class Startup
-{
-
-    public void ConfigureServices(IServiceCollection services)
-    {     
-        services
-            .AddHttpClient<IBasketService, BasketService>(c => c.BaseAddress = new Uri(Configuration["ApiSettings:BasketUrl"]))
-            .AddHttpMessageHandler<LoggingDelegatingHandler>()
-            .AddTransientHttpErrorPolicy(policy => policy.WaitAndRetryAsync(retryCount: 3, sleepDurationProvider: _ => TimeSpan.FromSeconds(2)))
-            .AddTransientHttpErrorPolicy(policy => policy.CircuitBreakerAsync(5, TimeSpan.FromSeconds(30)));
-
-        // ...
-    }
-}
-```
-
-if you new up a `HttpClient` instance and use it directly, `HttpClient`'s `HttpClientHandler` (which derives from `HttpMessageHandler`) causes the issue (it's the HttpClientHandler which it uses to make the HTTP calls that is the actual issue. It's this which opens the connections to the external services that will then remain open and block sockets)
-
-By using `IHttpClientFactory`, it assigns an `HttpMessageHandler` from a pool to the HttpClient. `HttpClient` may (or may not) use an existing HttpClientHandler from the pool and therefore use an existing open connection.
-
-
-## How to use HttpClient like IHttpClientFactory
-
-The `SocketsHttpHandler` establishes a pool of connections for each unique endpoint which your application makes an outbound HTTP request to via `HttpClient`. On the first request to an endpoint, when no existing connections exist, a new HTTP connection will be established and used for the request. Once that request completes, the connection is left open and is returned into the pool.
-
-```C#
-var socketsHandler = new SocketsHttpHandler
-{
-    PooledConnectionLifetime = TimeSpan.FromMinutes(10),
-    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
-    MaxConnectionsPerServer = 10
-};
-
-var client = new HttpClient(socketsHandler);  // <---------------------you have to pass and use the same HttpClient instance like static
-for (var i = 0; i < 5; i++)
-{
-    await client.GetAsync("https://www.google.com");
-}
-
-/* only one TCP connection
-TCP   192.168.1.139:53040   216.58.211.164:443   ESTABLISHED   20372
-*/
-```
-```C#
-// if you new up HttpClient for each request there will be 5 TCP connections
-for (var i = 0; i < 5; i++)
-{
-    var client = new HttpClient();  // <--------------- new up HttpClientHandler/SocketsHttpHandler for each request. Each SocketsHttpHandler manages a separate HttpConnectionPool
-    await client.GetAsync("https://www.google.com");
-}
-
-/*
-TCP   192.168.1.139:53115   216.58.211.164:443   TIME_WAIT     0
-TCP   192.168.1.139:53116   216.58.211.164:443   TIME_WAIT     0
-TCP   192.168.1.139:53118   216.58.211.164:443   TIME_WAIT     0
-TCP   192.168.1.139:53120   216.58.211.164:443   TIME_WAIT     0
-TCP   192.168.1.139:53121   216.58.211.164:443   TIME_WAIT     0
-*/
-
-public partial class HttpClient : HttpMessageInvoker
-{
-    // ...
-    public HttpClient() : this(new HttpClientHandler()) { }  
-
-    public HttpClient(HttpMessageHandler handler) : this(handler, true) { }
-}
-```
-
-note that if you don't re-use `HttpClient`, says you create another one
-
-```C#
-var socketsHandler2 = new SocketsHttpHandler
-{
-    PooledConnectionLifetime = TimeSpan.FromMinutes(10),
-    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
-    MaxConnectionsPerServer = 10
-};
-
-var client2 = new HttpClient(socketsHandler2); 
-await client.GetAsync("https://www.google.com");
-```
-
-So if you use a static `HttpClient` correctly with appropriate settings of `PooledConnectionLifetime` and `PooledConnectionIdleTimeout`, you can achieve the same effects as `IHttpClientFactory`, so "DO I STILL NEED IHTTPCLIENTFACTORY?" from https://www.stevejgordon.co.uk/httpclient-connection-pooling-in-dotnet-core
-
-> This is a very logical question which may arise as the result of this post. One of the features of IHttpClientFactory is the lifetime management of HttpMessageHandler chains and as a result, also of the underlying connections. Armed with the knowledge that HttpClient and SocketsHttpHandler can achieve the same effect, do we need to bother with IHttpClientFactory?
-
-> My view is that IHttpClientFactory has other benefits beyond helping manage connection lifetimes and still adds value when making outbound HTTP requests. It provides a great pattern to define logical configurations for HttpClient instances using the named or typed client approaches. The later, typed clients is a personal favourite of mine.
-
-> The fluent configuration approach to these logical clients also makes the use of custom DelegatingHandlers with clients very straightforward and clear. This includes the extension of this approach by the ASP.NET team to integrate with Polly in order to easily apply resiliency and transient fault handling for outbound requests.
-
-> Even without the lifetime management piece, I expect to use the factory in my applications for some time to come. From discussions I’ve seen online, it’s quite possible that in future releases, the lifetime management functionality will be deprecated and/or removed from IHttpClientFactory, since the problem it was solving is no longer applicable.**
-
-
-## What Happen when you call Dispose on `HttpClient`
-
-Let's say you use a single static `HttpClient` to make multiple requests (different urls) then calls `Dispose`.
-
-What happen is the underlying `HttpMessageHandler`/`SocketsHttpHandler` is disposed. `SocketsHttpHandler` uses `HttpConnectionPoolManager` to manage `HttpConnectionPool` which contains multiple TCP connections (for different url). When it is disposed, all underlying TCP connections will be closed (moved to `Time_WAIT`), so you cannot re-use any more TCP connection.  So one of recommended ways to use `HttpClient` is do not call `Dispose` on it
-
-
-## What's the difference between HttpClient's PooledConnectionLifetime and IHttpClientFactory's SetHandlerLifetime?
-
-`HttpClient`:
-
-```C#
-public class ScenarioFourController : ControllerBase
-{
-    private static readonly HttpClient Client = new(new SocketsHttpHandler
-    {
-        PooledConnectionLifetime = TimeSpan.FromSeconds(10)
-    })
-    {
-        BaseAddress = new Uri("https://jsonplaceholder.typicode.com/"),
-    };
-
-    [HttpGet()]
-    public async Task<ActionResult> Get()
-    {
-        var response = await Client.GetAsync("posts/1/comments");
-        // ...       
-    }
-}
-
-/* when you make a lot of requests in 10 secs
-TCP   192.168.1.37:51903   216.58.211.164:443   ESTABLISHED 
-*/
-
-/* when you make requests after 10 secs 
-TCP   192.168.1.37:51903   216.58.211.164:443   TIME_WAIT 
-TCP   192.168.1.37:51904   216.58.211.164:443   ESTABLISHED   <----------a new TCP connection is created as the one connection above cannot be reused anymore
-*/
-```
-
-Note that TCP connections are not torn down while actively being used to service requests. This lifetime is useful in order to allow connections to be reestablished periodically so as to better reflect DNS changes
-
-
-`IHttpClientFactory`:
-
-```C#
-builder.Services.AddHttpClient("typicode", c =>
-{
-    c.BaseAddress = new Uri("https://jsonplaceholder.typicode.com/");
-})
-.SetHandlerLifetime(TimeSpan.FromSeconds(10));
-
-public class ScenarioFiveController : ControllerBase
-{
-    private readonly IHttpClientFactory _factory;
-
-    public ScenarioFiveController(IHttpClientFactory factory)
-    {
-        _factory = factory;
-    }
-
-    [HttpGet()]
-    public async Task<ActionResult> Get()
-    {
-        var client1 = _factory.CreateClient("typicode");
-
-        var response = await client1.GetAsync("posts/1/comments");
-        // ...     
-    }
-}
-
-public class OtherController : ControllerBase
-{
-    private readonly IHttpClientFactory _factory;
-
-    public OtherController(IHttpClientFactory factory)
-    {
-        _factory = factory;
-    }
-
-    [HttpGet()]
-    public async Task<ActionResult> Get()
-    {
-        var client2 = _factory.CreateClient("typicode");
-                                                                 // <-----------------------------------------moment X
-        var response = await client2.GetAsync("posts/1/comments");
-        // ...     
-    }
-}
-
-/* when you make a lot of requests in 10 secs
-TCP   192.168.1.37:51903   216.58.211.164:443   ESTABLISHED 
-*/
-
-/* when you make requests after 10 secs 
-TCP   192.168.1.37:51903   216.58.211.164:443   ESTABLISHED   <----------unlike HttpClient example above which goes to TIME_WAIT, the "expired connection is not closed immediately
-TCP   192.168.1.37:51904   216.58.211.164:443   ESTABLISHED   <----------a new TCP connection
-
-*/
-```
-so why the connection doesn't goes to `TIME_WAIT` and still in `ESTABLISHED` state? This is because there could be other requests (OtherController) that already holds a reference to a `HttpClient` created by `IHttpClientFactory.CreateClient()` at moment X (before making an actual request), therefore the TCP connection still stays `ESTABLISHED`, which is different than IHttpClient's PooledConnectionLifetime, that's why it is called "HandlerLifeTime" in `SetHandlerLifetime` against "ConnectionLifetime" in `PooledConnectionLifetime`
-
-So how does it work internally?
-
-When using `IHttpClientFactory`, created `HttpClientHandler`/`SocketsHttpHandler` are wrapped in `LifetimeTrackingHttpMessageHandler` which has a default **2 mins** lifetime. New freseh created `LifetimeTrackingHttpMessageHandler` will be placed into ` _activeHandlers` and there is a Timer to check if the handler is expired, if it is, those handlers will be placed into 
-`_expiredHandlers` and there is another Timer that periodically does a check in **every 10 secs** to see if expired handlers can be disposed. The criteria to dispose a handler is to use `WeakReference` to see if the handler is being referenced (client2 in the above example)
-
-<-----------------add example of combining usage of setting SocketHandler and IHttpClientFactory with handler lifetime setting to Inifinitely
-
-
-<--------------add scopeAware example to explain why the httpcontext's scope is different than builder's own scope
-==========================aas================================================================================================
-
-ggf
 # Source Code
 
 
@@ -222,17 +11,19 @@ public static partial class HttpClientBuilderExtensions
         return builder;
     }
 
-    // ...
-
+    // <---------------important, that's how custom DelegatingHandlers are added, also note that scope which is not the same as HttpContext's scope
     public static IHttpClientBuilder AddHttpMessageHandler<THandler>(this IHttpClientBuilder builder) where THandler : DelegatingHandler
     { 
         builder.Services.Configure<HttpClientFactoryOptions>(builder.Name, options =>
         {
-            options.HttpMessageHandlerBuilderActions.Add(b => b.AdditionalHandlers.Add(b.Services.GetRequiredService<THandler>()));
+                                                      // b is HttpMessageHandlerBuilder
+            options.HttpMessageHandlerBuilderActions.Add(b => b.AdditionalHandlers.Add(b.Services.GetRequiredService<THandler>()));  // <------R1
         });
  
         return builder;
     }
+
+    // ...
 
     public static IHttpClientBuilder ConfigurePrimaryHttpMessageHandler(this IHttpClientBuilder builder, Func<HttpMessageHandler> configureHandler)
     { 
@@ -302,6 +93,22 @@ public static partial class HttpClientBuilderExtensions
             registry.NamedClientRegistrations[name] = type;
         }
     }
+}
+
+internal sealed class DefaultHttpClientBuilder : IHttpClientBuilder
+{
+    public DefaultHttpClientBuilder(IServiceCollection services, string name)
+    {
+        // The tracker references a descriptor. It marks the position of where default services are added to the collection.
+        var tracker = (DefaultHttpClientConfigurationTracker?)services.Single(sd => sd.ServiceType == typeof(DefaultHttpClientConfigurationTracker)).ImplementationInstance;
+ 
+        Services = new DefaultHttpClientBuilderServiceCollection(services, name == null, tracker);
+        Name = name!;
+    }
+ 
+    public string Name { get; }
+ 
+    public IServiceCollection Services { get; }
 }
 ```
 
@@ -398,7 +205,7 @@ public partial class HttpClientHandler : HttpMessageHandler
  
     public HttpClientHandler()
     {
-        _underlyingHandler = new SocketsHttpHandler();  // <-----------------------------------
+        _underlyingHandler = new SocketsHttpHandler();  // <-----------------------------------!
  
         ClientCertificateOptions = ClientCertificateOption.Manual;
     }
@@ -656,7 +463,7 @@ internal sealed class HttpConnectionPoolManager : IDisposable
         HttpConnectionPool? pool;
         while (!_pools.TryGetValue(key, out pool))
         {
-            pool = new HttpConnectionPool(this, key.Kind, key.Host, key.Port, key.SslHostName, key.ProxyUri);
+            pool = new HttpConnectionPool(this, key.Kind, key.Host, key.Port, key.SslHostName, key.ProxyUri);  // <----------------------
  
             if (_cleaningTimer == null)
             {
@@ -810,7 +617,7 @@ public static class HttpClientFactoryServiceCollectionExtensions
         services.AddOptions();
         services.AddMetrics();
  
-        services.TryAddTransient<HttpMessageHandlerBuilder, DefaultHttpMessageHandlerBuilder>();
+        services.TryAddTransient<HttpMessageHandlerBuilder, DefaultHttpMessageHandlerBuilder>();  // <-----------------this line enables usage of DelegatingHandler
         services.TryAddSingleton<DefaultHttpClientFactory>();
         services.TryAddSingleton<IHttpClientFactory>(serviceProvider => serviceProvider.GetRequiredService<DefaultHttpClientFactory>());
 
@@ -872,7 +679,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
  
     // default time of 10s for cleanup seems reasonable. Quick math: 
     // 10 distinct named clients * expiry time >= 1s = approximate cleanup queue of 100 items, this seems frequent enough
-    private readonly TimeSpan DefaultCleanupInterval = TimeSpan.FromSeconds(10);
+    private readonly TimeSpan DefaultCleanupInterval = TimeSpan.FromSeconds(10);  // <---------------------------------------ci
  
     private Timer? _cleanupTimer;
     private readonly object _cleanupTimerLock;
@@ -952,7 +759,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         HttpClientFactoryOptions options = _optionsMonitor.Get(name);
         if (!options.SuppressHandlerScope)
         {
-            scope = _scopeFactory.CreateScope();  // <---------------------important!
+            scope = _scopeFactory.CreateScope();  // <---------------------important!, D2
             services = scope.ServiceProvider;
         }
  
@@ -960,7 +767,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         {
             // _scopeFactory.CreateScope() is used to create HttpMessageHandlerBuilder and this scope will be injected into HttpMessageHandlerBuilder's constructor,
             // this scope is different to HttpContext scope, which might cause issues if you don't use it properly
-            HttpMessageHandlerBuilder builder = services.GetRequiredService<HttpMessageHandlerBuilder>();  // <-------------------------
+            HttpMessageHandlerBuilder builder = services.GetRequiredService<HttpMessageHandlerBuilder>();  // <-------------------------D2
             builder.Name = name;
  
             Action<HttpMessageHandlerBuilder> configure = Configure;
@@ -980,7 +787,8 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
             {
                 for (int i = 0; i < options.HttpMessageHandlerBuilderActions.Count; i++)
                 {
-                    options.HttpMessageHandlerBuilderActions[i](b);
+                    options.HttpMessageHandlerBuilderActions[i](b);  // <--------------D2, important! HttpMessageHandlerBuilder's scope will be used to create DelegatingHandlers
+                                                                     // that's when your custom DelegatingHandler get created
                 }
  
                 foreach (Action<HttpMessageHandlerBuilder> action in options.LoggingBuilderActions)
@@ -1002,7 +810,7 @@ internal class DefaultHttpClientFactory : IHttpClientFactory, IHttpMessageHandle
         var active = (ActiveHandlerTrackingEntry)state!;
  
         // the timer callback should be the only one removing from the active collection. If we can't find  our entry in the collection, then this is a bug.
-        bool removed = _activeHandlers.TryRemove(active.Name, out Lazy<ActiveHandlerTrackingEntry>? found);
+        bool removed = _activeHandlers.TryRemove(active.Name, out Lazy<ActiveHandlerTrackingEntry>? found);  // <------------------------ah
  
         // at this point the handler is no longer 'active' and will not be handed out to any new clients. However we haven't dropped our strong reference to the handler,
         // so we can't yet determine if  there are still any other outstanding references (we know there is at least one).
@@ -1071,13 +879,11 @@ internal sealed class ActiveHandlerTrackingEntry
  
     public void StartExpiryTimer(TimerCallback callback)
     {
-        if (Lifetime == Timeout.InfiniteTimeSpan)
-        {
+        if (Lifetime == Timeout.InfiniteTimeSpan) {
                 return; // never expires.
         }
  
-        if (Volatile.Read(ref _timerInitialized))
-        {
+        if (Volatile.Read(ref _timerInitialized)) {
             return;
         }
  
@@ -1089,10 +895,8 @@ internal sealed class ActiveHandlerTrackingEntry
         lock (_lock)
         {
             if (Volatile.Read(ref _timerInitialized))
-            {
                 return;
-            }
- 
+            
             _callback = callback;
             _timer = NonCapturingTimer.Create(_timerCallback, this, Lifetime, Timeout.InfiniteTimeSpan);
             _timerInitialized = true;
@@ -1132,8 +936,8 @@ public abstract class HttpMessageHandlerBuilder
 {
     public abstract string? Name { get; set; }
     public abstract HttpMessageHandler PrimaryHandler { get; set; }
-    public abstract IList<DelegatingHandler> AdditionalHandlers { get; }
-    public virtual IServiceProvider Services { get; } = null!;
+    public abstract IList<DelegatingHandler> AdditionalHandlers { get; }  // <---------contains custom DelegatingHandlers created by the scope below
+    public virtual IServiceProvider Services { get; } = null!;  // <------------important, this is the scope to be used to create DelegatingHandlers
 
     public abstract HttpMessageHandler Build();
 
@@ -1176,8 +980,7 @@ internal sealed class DefaultHttpMessageHandlerBuilder : HttpMessageHandlerBuild
  
     private string? _name;
  
-    public override string? Name
-    {
+    public override string? Name {
         get => _name;
         set {
             _name = value;
@@ -1207,7 +1010,7 @@ public class HttpClientFactoryOptions
 {
     internal static readonly TimeSpan MinimumHandlerLifetime = TimeSpan.FromSeconds(1);
  
-    private TimeSpan _handlerLifetime = TimeSpan.FromMinutes(2);  // <-------------------------------
+    private TimeSpan _handlerLifetime = TimeSpan.FromMinutes(2);  // <------------ default handler lifetime for IHttpClientFactory is 2 minutes
 
     public IList<Action<HttpMessageHandlerBuilder>> HttpMessageHandlerBuilderActions { get; } = new List<Action<HttpMessageHandlerBuilder>>();
 
@@ -1440,20 +1243,41 @@ public class HttpMessageInvoker : IDisposable
     // ...
 }
 //-----------------------------Ʌ
+
+//-----------------------------------------------V
+internal static partial class HttpHandlerDefaults
+{
+    public const int DefaultMaxAutomaticRedirections = 50;
+    public const int DefaultMaxResponseDrainSize = 1024 * 1024;
+    public static readonly TimeSpan DefaultResponseDrainTimeout = TimeSpan.FromSeconds(2);
+    public const int DefaultMaxResponseHeadersLength = 64; // Units in K (1024) bytes.
+    public const DecompressionMethods DefaultAutomaticDecompression = DecompressionMethods.None;
+    public const bool DefaultAutomaticRedirection = true;
+    public const bool DefaultUseCookies = true;
+    public const bool DefaultPreAuthenticate = false;
+    public const ClientCertificateOption DefaultClientCertificateOption = ClientCertificateOption.Manual;
+    public const bool DefaultUseProxy = true;
+    public const bool DefaultUseDefaultCredentials = false;
+    public const bool DefaultCheckCertificateRevocationList = false;
+    public const TokenImpersonationLevel DefaultImpersonationLevel = TokenImpersonationLevel.None;
+    public static readonly TimeSpan DefaultPooledConnectionLifetime = Timeout.InfiniteTimeSpan;
+    public static readonly TimeSpan DefaultPooledConnectionIdleTimeout = TimeSpan.FromMinutes(1);
+    public static readonly TimeSpan DefaultExpect100ContinueTimeout = TimeSpan.FromSeconds(1);
+    public static readonly TimeSpan DefaultConnectTimeout = Timeout.InfiniteTimeSpan;
+}
+//-----------------------------------------------Ʌ
 ```
-
-<----------------------!!!write down what will happen when you call using() on the client created by IHttpClientFactory, nothing happen
-
 
 References:
 
-
-https://blog.davidvassallo.me/2010/07/13/time_wait-and-port-reuse/
+https://organicprogrammer.com/2018/12/14/why-tcp-four-way-handshake/
+https://organicprogrammer.com/2021/10/25/understand-http1-1-persistent-connection-golang/
 https://www.mytechramblings.com/posts/dotnet-httpclient-basic-usage-scenarios/#:~:text=Once%20this%20lifetime%20expires%2C%20the,and%20removed%20from%20the%20pool.
+https://byterot.blogspot.com/2016/07/singleton-httpclient-dns.html
+https://blog.davidvassallo.me/2010/07/13/time_wait-and-port-reuse/
 https://medium.com/@nuno.caneco/c-httpclient-should-not-be-disposed-or-should-it-45d2a8f568bc
 https://www.stevejgordon.co.uk/httpclient-connection-pooling-in-dotnet-core
 https://andrewlock.net/exporing-the-code-behind-ihttpclientfactory/
 https://www.meziantou.net/avoid-dns-issues-with-httpclient-in-dotnet.htm
 https://www.stevejgordon.co.uk/introduction-to-httpclientfactory-aspnetcore
-https://medium.com/@organicprogrammer/why-tcp-connection-termination-needs-four-way-handshake-90d68bb82816
 https://learn.microsoft.com/en-us/dotnet/architecture/microservices/implement-resilient-applications/use-httpclientfactory-to-implement-resilient-http-requests
