@@ -501,9 +501,9 @@ see hc section for details:
 ```C#
 /*
 note that the design of `HttpMessageHandler` is to use `DelegatingHandler` so that `DefaultHttpMessageHandlerBuilder` can create `HttpMessageHandler PrimaryHandler = new HttpClientHandler()` and this `HttpClientHandler:HttpMessageHandler` is assigned to `DelegatingHandler.InnerHandler`, see ihc section
+while `HttpMessageHandlerStage` is for another pipeline in `SocketsHttpHandler` only
 */
 
-while `HttpMessageHandlerStage` is for another pipeline in `SocketsHttpHandler` only
 //-------------------------------------V
 public abstract class DelegatingHandler : HttpMessageHandler
 {
@@ -1040,7 +1040,7 @@ public sealed class SocketsHttpHandler : HttpMessageHandler  // <-------------th
         // DiagnosticsHandler is inserted before RedirectHandler so that trace propagation is done on redirects as well
         if (DiagnosticsHandler.IsGloballyEnabled() && settings._activityHeadersPropagator is DistributedContextPropagator propagator)
         {
-            handler = new DiagnosticsHandler(handler, propagator, settings._allowAutoRedirect);
+            handler = new DiagnosticsHandler(handler, propagator, settings._allowAutoRedirect);  // <------------------------------
         }
  
         handler = new MetricsHandler(handler, settings._meterFactory, out Meter meter);

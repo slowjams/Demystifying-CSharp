@@ -14,10 +14,10 @@ public class Program
         Host.CreateDefaultBuilder(args)
            .ConfigureLogging((hostBuilderContext, loggingBuilder) =>
            {
-               loggingBuilder.Configure(options => options.ActivityTrackingOptions = ActivityTrackingOptions.TraceId | ActivityTrackingOptions.SpanId);
+               loggingBuilder.Configure(options => options.ActivityTrackingOptions = ActivityTrackingOptions.TraceId | ActivityTrackingOptions.SpanId);  // <------scolog
                loggingBuilder.AddConsole(options =>
                {
-                   options.IncludeScopes = true;
+                   options.IncludeScopes = true;   // <----------fis
                });
            })
            .ConfigureWebHostDefaults(webBuilder =>
@@ -41,7 +41,7 @@ public class Program
       "FormatterName": "json",
       "FormatterOptions": {
         "SingleLine": true,
-        "IncludeScopes": true,  // 
+        "IncludeScopes": true,  // <----------------------fis
         "TimestampFormat": "HH:mm:ss ",
         "UseUtcTimestamp": true,
         "JsonWriterOptions": {
@@ -954,56 +954,34 @@ internal sealed class LoggerFactoryScopeProvider : IExternalScopeProvider
         return newScope;
     }
 
-    private sealed class Scope : IDisposable
-    {
-        private readonly LoggerFactoryScopeProvider _provider;
-        private bool _isDisposed;
- 
-        internal Scope(LoggerFactoryScopeProvider provider, object? state, Scope? parent)
-        {
-            _provider = provider;
-            State = state;
-            Parent = parent;
-        }
- 
-        public Scope? Parent { get; }
- 
-        public object? State { get; }
- 
-        public override string? ToString()
-        {
-                return State?.ToString();
-        }
- 
-        public void Dispose()  // <-----------------------no need to understand, just get the idea that need to call Dispose on Scope
-        {
-            if (!_isDisposed)
-            {
-                _provider._currentScope.Value = Parent;
-                _isDisposed = true;
-            }
-        }
-    }
-
     public void ForEachScope<TState>(Action<object?, TState> callback, TState state)
     {
-        // ...
-        if (_activityTrackingOption != ActivityTrackingOptions.None)
+        void Report(Scope? current)
         {
-            Activity? activity = Activity.Current;
+            if (current == null)
+            {
+                return;
+            }
+            Report(current.Parent);
+            callback(current.State, state);
+        }
+
+        if (_activityTrackingOption != ActivityTrackingOptions.None)  // <----------------------scolog
+        {
+            Activity? activity = Activity.Current;   // <----------------------scolog
             if (activity != null)
             {
                 const string propertyKey = "__ActivityLogScope__";
- 
+
                 ActivityLogScope? activityLogScope = activity.GetCustomProperty(propertyKey) as ActivityLogScope;
                 if (activityLogScope == null)
                 {
-                    activityLogScope = new ActivityLogScope(activity, _activityTrackingOption);
+                    activityLogScope = new ActivityLogScope(activity, _activityTrackingOption);   // <----------------------scolog
                     activity.SetCustomProperty(propertyKey, activityLogScope);
                 }
- 
-                callback(activityLogScope, state);
- 
+
+                callback(activityLogScope, state);  // <----------------------scolog
+
                 // Tags and baggage are opt-in and thus we assume that most of the time it will not be used.
                 if ((_activityTrackingOption & ActivityTrackingOptions.Tags) != 0 && activity.TagObjects.GetEnumerator().MoveNext())
                 {
@@ -1011,7 +989,7 @@ internal sealed class LoggerFactoryScopeProvider : IExternalScopeProvider
                     // We do this to safe the allocation of a wrapper object.
                     callback(activity.TagObjects, state);
                 }
- 
+
                 if ((_activityTrackingOption & ActivityTrackingOptions.Baggage) != 0)
                 {
                     // Only access activity.Baggage as every call leads to an allocation
@@ -1026,7 +1004,139 @@ internal sealed class LoggerFactoryScopeProvider : IExternalScopeProvider
                 }
             }
         }
-        // ...
+
+        Report(_currentScope.Value);
+    }
+
+    private sealed class Scope : IDisposable
+    {
+        private readonly LoggerFactoryScopeProvider _provider;
+        private bool _isDisposed;
+
+        internal Scope(LoggerFactoryScopeProvider provider, object? state, Scope? parent)
+        {
+            _provider = provider;
+            State = state;
+            Parent = parent;
+        }
+
+        public Scope? Parent { get; }
+
+        public object? State { get; }
+
+        public override string? ToString()
+        {
+                return State?.ToString();
+        }
+
+        public void Dispose()  // <-----------------------no need to understand, just get the idea that need to call Dispose on Scope
+        {
+            if (!_isDisposed)
+            {
+                _provider._currentScope.Value = Parent;
+                _isDisposed = true;
+            }
+        }
+    }
+
+    private sealed class ActivityLogScope : IReadOnlyList<KeyValuePair<string, object?>>
+    {
+        private string? _cachedToString;
+        private const int MaxItems = 5;
+        private readonly KeyValuePair<string, object?>[] _items = new KeyValuePair<string, object?>[MaxItems];
+
+        public ActivityLogScope(Activity activity, ActivityTrackingOptions activityTrackingOption)
+        {
+            int count = 0;
+            if ((activityTrackingOption & ActivityTrackingOptions.SpanId) != 0)
+            {
+                _items[count++] = new KeyValuePair<string, object?>("SpanId", activity.GetSpanId());  // <-----------------scolog
+            }
+
+            if ((activityTrackingOption & ActivityTrackingOptions.TraceId) != 0)
+            {
+                _items[count++] = new KeyValuePair<string, object?>("TraceId", activity.GetTraceId());  // <-----------------scolog
+            }
+
+            if ((activityTrackingOption & ActivityTrackingOptions.ParentId) != 0)
+            {
+                _items[count++] = new KeyValuePair<string, object?>("ParentId", activity.GetParentId());  // <-----------------scolog
+            }
+
+            if ((activityTrackingOption & ActivityTrackingOptions.TraceState) != 0)
+            {
+                _items[count++] = new KeyValuePair<string, object?>("TraceState", activity.TraceStateString);  // <-----------------scolog
+            }
+
+            if ((activityTrackingOption & ActivityTrackingOptions.TraceFlags) != 0)
+            {
+                _items[count++] = new KeyValuePair<string, object?>("TraceFlags", activity.ActivityTraceFlags);  // <-----------------scolog
+            }
+
+            Count = count;
+        }
+
+        public int Count { get; }
+
+        public KeyValuePair<string, object?> this[int index]
+        {
+            get
+            {
+                if (index >= Count)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(index));
+                }
+
+                return _items[index];
+            }
+        }
+     
+        public IEnumerator<KeyValuePair<string, object?>> GetEnumerator()
+        {
+            for (int i = 0; i < Count; ++i)
+            {
+                yield return this[i];
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
+        }
+    }
+    // ...
+
+    internal static class ActivityExtensions
+    {
+        public static string GetSpanId(this Activity activity)
+        {
+            return activity.IdFormat switch
+            {
+                ActivityIdFormat.Hierarchical => activity.Id,
+                ActivityIdFormat.W3C => activity.SpanId.ToHexString(),
+                _ => null,
+            } ?? string.Empty;
+        }
+ 
+        public static string GetTraceId(this Activity activity)
+        {
+            return activity.IdFormat switch
+            {
+                ActivityIdFormat.Hierarchical => activity.RootId,
+                ActivityIdFormat.W3C => activity.TraceId.ToHexString(),
+                _ => null,
+            } ?? string.Empty;
+        }
+ 
+        public static string GetParentId(this Activity activity)
+        {
+            return activity.IdFormat switch
+            {
+                ActivityIdFormat.Hierarchical => activity.ParentId,
+                ActivityIdFormat.W3C => activity.ParentSpanId.ToHexString(),
+                _ => null,
+            } ?? string.Empty;
+        }
     }
 }
 //----------------------------------------------Ʌ
@@ -1134,22 +1244,22 @@ internal sealed class SimpleConsoleFormatter : ConsoleFormatter, IDisposable
 
     private void WriteScopeInformation(TextWriter textWriter, IExternalScopeProvider? scopeProvider, bool singleLine)  // IExternalScopeProvider is LoggerFactoryScopeProvider
     {
-        if (FormatterOptions.IncludeScopes && scopeProvider != null)
+        if (FormatterOptions.IncludeScopes && scopeProvider != null)  // <-----------------fis, that's how IncludeScopes is checked
         {
             bool paddingNeeded = !singleLine;
-            scopeProvider.ForEachScope((scope, state) =>  // <--------------------------------------
+            scopeProvider.ForEachScope((scope, state) =>  // <--------------------------------------scolog
             {
                 if (paddingNeeded)
                 {
                     paddingNeeded = false;
                     state.Write(_messagePadding);
-                    state.Write("=> ");  // <----------------------now you know why scope in the console print =>
+                    state.Write("=> ");  // <----------------------scobol, now you know why scope in the console print "=>",
                 }
                 else
                 {
                     state.Write(" => ");
                 }
-                state.Write(scope);
+                state.Write(scope);  // <--------------------------------------scolog, state is textWriter, scope is ActivityLogScope
             }, textWriter);
  
             if (!paddingNeeded && !singleLine)
@@ -2208,6 +2318,394 @@ internal readonly struct ScopeLogger
 ```
 
 
+## Logging with IHttpClientFactory
+
+```C#
+//----------------------------------------------------------V
+internal sealed class LoggingHttpMessageHandlerBuilderFilter : IHttpMessageHandlerBuilderFilter
+{
+    // we want to prevent a circular depencency between ILoggerFactory and IHttpMessageHandlerBuilderFilter, in case
+    // any of ILoggerProvider instances use IHttpClientFactory to send logs to an external server
+    private ILoggerFactory? _loggerFactory;
+    private ILoggerFactory LoggerFactory => _loggerFactory ??= _serviceProvider.GetRequiredService<ILoggerFactory>();
+    private readonly IServiceProvider _serviceProvider;
+    private readonly IOptionsMonitor<HttpClientFactoryOptions> _optionsMonitor;
+
+    public LoggingHttpMessageHandlerBuilderFilter(IServiceProvider serviceProvider, IOptionsMonitor<HttpClientFactoryOptions> optionsMonitor)
+    {
+
+        _serviceProvider = serviceProvider;
+        _optionsMonitor = optionsMonitor;
+    }
+
+    public Action<HttpMessageHandlerBuilder> Configure(Action<HttpMessageHandlerBuilder> next)
+    {
+        return (builder) =>
+        {
+            // Run other configuration first, we want to decorate.
+            next(builder);
+
+            HttpClientFactoryOptions options = _optionsMonitor.Get(builder.Name);
+            if (options.SuppressDefaultLogging)
+            {
+                return;
+            }
+
+            string loggerName = !string.IsNullOrEmpty(builder.Name) ? builder.Name : "Default";
+
+            // We want all of our logging message to show up as-if they are coming from HttpClient,
+            // but also to include the name of the client for more fine-grained control.
+            ILogger outerLogger = LoggerFactory.CreateLogger($"System.Net.Http.HttpClient.{loggerName}.LogicalHandler");   // <-----------------------loh
+            ILogger innerLogger = LoggerFactory.CreateLogger($"System.Net.Http.HttpClient.{loggerName}.ClientHandler");    // <-----------------------clh
+
+            // The 'scope' handler goes first so it can surround everything.
+            builder.AdditionalHandlers.Insert(0, new LoggingScopeHttpMessageHandler(outerLogger, options));   // <-----------------------lsch0.
+
+            // We want this handler to be last so we can log details about the request after service discovery and security happen.
+            builder.AdditionalHandlers.Add(new LoggingHttpMessageHandler(innerLogger, options));
+        };
+    }
+}
+//----------------------------------------------------------Ʌ
+
+//-----------------------------------------V
+public class LoggingScopeHttpMessageHandler : DelegatingHandler
+{
+    private readonly ILogger _logger;
+    private readonly HttpClientFactoryOptions? _options;
+
+    private static readonly Func<string, bool> _shouldNotRedactHeaderValue = (header) => false;
+
+    public LoggingScopeHttpMessageHandler(ILogger logger)
+    {
+        _logger = logger;
+    }
+
+    public LoggingScopeHttpMessageHandler(ILogger logger, HttpClientFactoryOptions options)
+    {
+        _logger = logger;
+        _options = options;
+    }
+
+    private Task<HttpResponseMessage> SendCoreAsync(HttpRequestMessage request, bool useAsync, CancellationToken cancellationToken)
+    {
+        return Core(request, useAsync, cancellationToken);
+
+        async Task<HttpResponseMessage> Core(HttpRequestMessage request, bool useAsync, CancellationToken cancellationToken)
+        {
+            var stopwatch = ValueStopwatch.StartNew();
+
+            Func<string, bool> shouldRedactHeaderValue = _options?.ShouldRedactHeaderValue ?? _shouldNotRedactHeaderValue;
+
+            using (Log.BeginRequestPipelineScope(_logger, request))  // <-----------------------lsch1.0
+            {
+                Log.RequestPipelineStart(_logger, request, shouldRedactHeaderValue);  // <-----------------------lsch2.0
+                HttpResponseMessage response = useAsync
+                    ? await base.SendAsync(request, cancellationToken).ConfigureAwait(false) : base.Send(request, cancellationToken);
+
+                Log.RequestPipelineEnd(_logger, response, stopwatch.GetElapsedTime(), shouldRedactHeaderValue);
+
+                return response;
+            }
+        }
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        => SendCoreAsync(request, useAsync: true, cancellationToken);
+
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        => SendCoreAsync(request, useAsync: false, cancellationToken).GetAwaiter().GetResult();
+
+    // Used in tests
+    internal static class Log
+    {
+        public static class EventIds
+        {
+            public static readonly EventId PipelineStart = new EventId(100, "RequestPipelineStart");
+            public static readonly EventId PipelineEnd = new EventId(101, "RequestPipelineEnd");
+
+            public static readonly EventId RequestHeader = new EventId(102, "RequestPipelineRequestHeader");
+            public static readonly EventId ResponseHeader = new EventId(103, "RequestPipelineResponseHeader");
+        }
+
+        private static readonly Func<ILogger, HttpMethod, string?, IDisposable?> _beginRequestPipelineScope = LoggerMessage.DefineScope<HttpMethod, string?>("HTTP {HttpMethod} {Uri}");   // <-----------------------lsch1.1
+
+        /*
+        public static class LoggerMessage
+        {
+            // ...
+            public static Func<ILogger, T1, T2, IDisposable?> DefineScope<T1, T2>(string formatString)
+            {
+                LogValuesFormatter formatter = CreateLogValuesFormatter(formatString, expectedNamedParameterCount: 2);
+      
+                return (logger, arg1, arg2) => logger.BeginScope(new LogValues<T1, T2>(formatter, arg1, arg2));  // <-----------------------lsch1.2.
+            }
+        }       
+        */
+
+        private static readonly Action<ILogger, HttpMethod, string?, Exception?> _requestPipelineStart = LoggerMessage.Define<HttpMethod, string?>(
+            LogLevel.Information,
+            EventIds.PipelineStart,
+            "Start processing HTTP request {HttpMethod} {Uri}");   // <-----------------------lsch2.3
+
+        /*
+        public static Action<ILogger, T1, T2, Exception?> Define<T1, T2>(LogLevel logLevel, EventId eventId, string formatString)
+        {
+            // ...
+            LogValuesFormatter formatter = CreateLogValuesFormatter(formatString, expectedNamedParameterCount: 2);
+ 
+            void Log(ILogger logger, T1 arg1, T2 arg2, Exception? exception)
+            {
+                logger.Log(logLevel, eventId, new LogValues<T1, T2>(formatter, arg1, arg2), exception, LogValues<T1, T2>.Callback);
+            }
+ 
+            if (options != null && options.SkipEnabledCheck)
+            {
+                return Log;
+            }
+ 
+            return (logger, arg1, arg2, exception) =>
+            {
+                if (logger.IsEnabled(logLevel))
+                {
+                    Log(logger, arg1, arg2, exception);   // <-----------------------lsch2.4
+                }
+            }          
+        }          
+        */
+
+        private static readonly Action<ILogger, double, int, Exception?> _requestPipelineEnd = LoggerMessage.Define<double, int>(
+            LogLevel.Information,
+            EventIds.PipelineEnd,
+            "End processing HTTP request after {ElapsedMilliseconds}ms - {StatusCode}");
+
+        public static IDisposable? BeginRequestPipelineScope(ILogger logger, HttpRequestMessage request)   // <-----------------------lsch1.1
+        {
+            return _beginRequestPipelineScope(logger, request.Method, GetUriString(request.RequestUri));
+        }
+
+        public static void RequestPipelineStart(ILogger logger, HttpRequestMessage request, Func<string, bool> shouldRedactHeaderValue)  // <-----------------------lsch2.1
+        {
+            _requestPipelineStart(logger, request.Method, GetUriString(request.RequestUri), null);  // <-----------------------lsch2.2
+
+            if (logger.IsEnabled(LogLevel.Trace))
+            {
+                logger.Log(
+                    LogLevel.Trace,
+                    EventIds.RequestHeader,
+                    new HttpHeadersLogValue(HttpHeadersLogValue.Kind.Request, request.Headers, request.Content?.Headers, shouldRedactHeaderValue),
+                    null,
+                    (state, ex) => state.ToString());
+            }
+        }
+
+        public static void RequestPipelineEnd(ILogger logger, HttpResponseMessage response, TimeSpan duration, Func<string, bool> shouldRedactHeaderValue)
+        {
+            _requestPipelineEnd(logger, duration.TotalMilliseconds, (int)response.StatusCode, null);
+
+            if (logger.IsEnabled(LogLevel.Trace))
+            {
+                logger.Log(
+                    LogLevel.Trace,
+                    EventIds.ResponseHeader,
+                    new HttpHeadersLogValue(HttpHeadersLogValue.Kind.Response, response.Headers, response.Content?.Headers, shouldRedactHeaderValue),
+                    null,
+                    (state, ex) => state.ToString());
+            }
+        }
+
+        private static string? GetUriString(Uri? requestUri);
+    }
+}
+//-----------------------------------------Ʌ
+
+//------------------------------------V
+public class LoggingHttpMessageHandler : DelegatingHandler
+{
+    private readonly ILogger _logger;
+    private readonly HttpClientFactoryOptions? _options;
+
+    private static readonly Func<string, bool> _shouldNotRedactHeaderValue = (header) => false;
+
+    public LoggingHttpMessageHandler(ILogger logger)
+    {
+        _logger = logger;
+    }
+
+    public LoggingHttpMessageHandler(ILogger logger, HttpClientFactoryOptions options)
+    {
+        _logger = logger;
+        _options = options;
+    }
+
+    private Task<HttpResponseMessage> SendCoreAsync(HttpRequestMessage request, bool useAsync, CancellationToken cancellationToken)
+    {
+        return Core(request, useAsync, cancellationToken);
+
+        async Task<HttpResponseMessage> Core(HttpRequestMessage request, bool useAsync, CancellationToken cancellationToken)
+        {
+            Func<string, bool> shouldRedactHeaderValue = _options?.ShouldRedactHeaderValue ?? _shouldNotRedactHeaderValue;
+
+            // not using a scope here because we always expect this to be at the end of the pipeline, thus there's  not really anything to surround.
+            Log.RequestStart(_logger, request, shouldRedactHeaderValue);   // <----------------log "Sending HTTP request {HttpMethod} {Uri}" and 
+                                                                           // if logLevel is Trace, log request.Headers
+            var stopwatch = ValueStopwatch.StartNew();
+            HttpResponseMessage response = useAsync ? await base.SendAsync(request, cancellationToken).ConfigureAwait(false)
+
+            Log.RequestEnd(_logger, response, stopwatch.GetElapsedTime(), shouldRedactHeaderValue);  // <--------------------------------log StatusCode and if logLevel
+                                                                                                     // is Trace, log response.Headers
+            return response;
+        }
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        => SendCoreAsync(request, useAsync: true, cancellationToken);
+    
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        => SendCoreAsync(request, useAsync: false, cancellationToken).GetAwaiter().GetResult();
+
+}
+//------------------------------------Ʌ
+```
+
+```C#
+//-----------------------------V
+internal static class LogHelper
+{
+   private static readonly LogDefineOptions s_skipEnabledCheckLogDefineOptions = new LogDefineOptions() { SkipEnabledCheck = true };
+
+   private static class EventIds
+   {
+      public static readonly EventId RequestStart = new EventId(100, "RequestStart");
+      public static readonly EventId RequestEnd = new EventId(101, "RequestEnd");
+
+      public static readonly EventId RequestHeader = new EventId(102, "RequestHeader");
+      public static readonly EventId ResponseHeader = new EventId(103, "ResponseHeader");
+
+      public static readonly EventId RequestFailed = new EventId(104, "RequestFailed");
+
+      public static readonly EventId PipelineStart = new EventId(100, "RequestPipelineStart");
+      public static readonly EventId PipelineEnd = new EventId(101, "RequestPipelineEnd");
+
+      public static readonly EventId RequestPipelineRequestHeader = new EventId(102, "RequestPipelineRequestHeader");
+      public static readonly EventId RequestPipelineResponseHeader = new EventId(103, "RequestPipelineResponseHeader");
+
+      public static readonly EventId PipelineFailed = new EventId(104, "RequestPipelineFailed");
+   }
+
+   public static readonly Func<string, bool> ShouldRedactHeaderValue = (header) => true;
+
+   private static readonly Action<ILogger, HttpMethod, string?, Exception?> _requestStart = LoggerMessage.Define<HttpMethod, string?>(
+      LogLevel.Information,
+      EventIds.RequestStart,
+      "Sending HTTP request {HttpMethod} {Uri}",
+      s_skipEnabledCheckLogDefineOptions);
+
+   private static readonly Action<ILogger, double, int, Exception?> _requestEnd = LoggerMessage.Define<double, int>(
+      LogLevel.Information,
+      EventIds.RequestEnd,
+      "Received HTTP response headers after {ElapsedMilliseconds}ms - {StatusCode}");
+
+   private static readonly Action<ILogger, double, Exception?> _requestFailed = LoggerMessage.Define<double>(
+      LogLevel.Information,
+      EventIds.RequestFailed,
+      "HTTP request failed after {ElapsedMilliseconds}ms");
+
+   private static readonly Func<ILogger, HttpMethod, string?, IDisposable?> _beginRequestPipelineScope = LoggerMessage.DefineScope<HttpMethod, string?>("HTTP {HttpMethod} {Uri}");
+
+   private static readonly Action<ILogger, HttpMethod, string?, Exception?> _requestPipelineStart = LoggerMessage.Define<HttpMethod, string?>(
+      LogLevel.Information,
+      EventIds.PipelineStart,
+      "Start processing HTTP request {HttpMethod} {Uri}");
+
+   private static readonly Action<ILogger, double, int, Exception?> _requestPipelineEnd = LoggerMessage.Define<double, int>(
+      LogLevel.Information,
+      EventIds.PipelineEnd,
+      "End processing HTTP request after {ElapsedMilliseconds}ms - {StatusCode}");
+
+   private static readonly Action<ILogger, double, Exception?> _requestPipelineFailed = LoggerMessage.Define<double>(
+      LogLevel.Information,
+      EventIds.PipelineFailed,
+      "HTTP request failed after {ElapsedMilliseconds}ms");
+
+   public static void LogRequestStart(this ILogger logger, HttpRequestMessage request, Func<string, bool> shouldRedactHeaderValue)
+   {
+      // We check here to avoid allocating in the GetRedactedUriString call unnecessarily
+      if (logger.IsEnabled(LogLevel.Information))
+      {
+            _requestStart(logger, request.Method, UriRedactionHelper.GetRedactedUriString(request.RequestUri), null);
+      }
+
+      if (logger.IsEnabled(LogLevel.Trace))
+      {
+            logger.Log(
+               LogLevel.Trace,
+               EventIds.RequestHeader,
+               new HttpHeadersLogValue(HttpHeadersLogValue.Kind.Request, request.Headers, request.Content?.Headers, shouldRedactHeaderValue),
+               null,
+               (state, ex) => state.ToString());
+      }
+   }
+
+   public static void LogRequestEnd(this ILogger logger, HttpResponseMessage response, TimeSpan duration, Func<string, bool> shouldRedactHeaderValue)
+   {
+      _requestEnd(logger, duration.TotalMilliseconds, (int)response.StatusCode, null);
+
+      if (logger.IsEnabled(LogLevel.Trace))
+      {
+            logger.Log(
+               LogLevel.Trace,
+               EventIds.ResponseHeader,
+               new HttpHeadersLogValue(HttpHeadersLogValue.Kind.Response, response.Headers, response.Content?.Headers, shouldRedactHeaderValue),
+               null,
+               (state, ex) => state.ToString());
+      }
+   }
+
+   public static void LogRequestFailed(this ILogger logger, TimeSpan duration, HttpRequestException exception) =>
+      _requestFailed(logger, duration.TotalMilliseconds, exception);
+
+   public static IDisposable? BeginRequestPipelineScope(this ILogger logger, HttpRequestMessage request, out string? formattedUri)
+   {
+      formattedUri = UriRedactionHelper.GetRedactedUriString(request.RequestUri);
+      return _beginRequestPipelineScope(logger, request.Method, formattedUri);
+   }
+
+   public static void LogRequestPipelineStart(this ILogger logger, HttpRequestMessage request, string? formattedUri, Func<string, bool> shouldRedactHeaderValue)
+   {
+      _requestPipelineStart(logger, request.Method, formattedUri, null);
+
+      if (logger.IsEnabled(LogLevel.Trace))
+      {
+            logger.Log(
+               LogLevel.Trace,
+               EventIds.RequestPipelineRequestHeader,
+               new HttpHeadersLogValue(HttpHeadersLogValue.Kind.Request, request.Headers, request.Content?.Headers, shouldRedactHeaderValue),
+               null,
+               (state, ex) => state.ToString());
+      }
+   }
+
+   public static void LogRequestPipelineEnd(this ILogger logger, HttpResponseMessage response, TimeSpan duration, Func<string, bool> shouldRedactHeaderValue)
+   {
+      _requestPipelineEnd(logger, duration.TotalMilliseconds, (int)response.StatusCode, null);
+
+      if (logger.IsEnabled(LogLevel.Trace))
+      {
+            logger.Log(
+               LogLevel.Trace,
+               EventIds.RequestPipelineResponseHeader,
+               new HttpHeadersLogValue(HttpHeadersLogValue.Kind.Response, response.Headers, response.Content?.Headers, shouldRedactHeaderValue),
+               null,
+               (state, ex) => state.ToString());
+      }
+   }
+
+   public static void LogRequestPipelineFailed(this ILogger logger, TimeSpan duration, HttpRequestException exception) =>
+      _requestPipelineFailed(logger, duration.TotalMilliseconds, exception);
+}
+//-----------------------------Ʌ
+```
 =================================================================================================================================
 
 ## Serilog
@@ -2253,7 +2751,7 @@ public class Program
 //------------------Ʌ
 ```
 
-An Elasticsearch **index** is a logical namespace that holds a collection of documents, where each document is a collection of fields — which, in turn, are key-value pairs that contain your data. Elasticsearch indices are not the same as you’d find in a relational database. Think of an Elasticsearch cluster as a database that can contain many indices you can consider as a table, and within each index, you have many documents.
+An Elasticsearch **index** is a logical namespace that holds a collection of documents, where each document is a collection of fields — which, in turn, are key-value pairs that contain your data. Elasticsearch indices are not the same as you'd find in a relational database. Think of an Elasticsearch cluster as a database that can contain many indices you can consider as a table, and within each index, you have many documents.
 
 ```C#
 public class XXXService : IXXXService

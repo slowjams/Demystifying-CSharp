@@ -103,7 +103,7 @@ public static class WebHost
          });
 
          loggingBuilder.AddConfiguration(hostingContext.Configuration.GetSection("Logging"));
-         loggingBuilder.AddConsole();
+         loggingBuilder.AddConsole();  // <--------------------------Console logging provider is used by default
          loggingBuilder.AddDebug();
          loggingBuilder.AddEventSourceLogger();
       }).
@@ -189,10 +189,15 @@ internal sealed class GenericWebHostBuilder : IWebHostBuilder, ISupportsStartup,
    public IWebHostBuilder ConfigureServices(Action<WebHostBuilderContext, IServiceCollection> configureServices)
    {
       // call IHostBuilder.ConfigureServices()
-      _builder.ConfigureServices((context, builder) =>  // builder is IServiceCollection
+      _builder.ConfigureServices((context, services) =>  // services is IServiceCollection
       {
          var webhostBuilderContext = GetWebHostBuilderContext(context);
-         configureServices(webhostBuilderContext, builder);
+         configureServices(webhostBuilderContext, services);
+
+         services.TryAddSingleton(sp => new DiagnosticListener("Microsoft.AspNetCore"));   // <--------------dlr0.1
+         services.TryAddSingleton<DiagnosticSource>(sp => sp.GetRequiredService<DiagnosticListener>());  // <--------------dlr0.2
+         services.TryAddSingleton(sp => new ActivitySource("Microsoft.AspNetCore"));      // <--------------dlr0.3.
+         // ...
       });
  
       return this;
@@ -221,9 +226,9 @@ internal sealed partial class GenericWebHostService : IHostedService
    {
         Options = options.Value;
         Server = server;
-        Logger = loggerFactory.CreateLogger("Microsoft.AspNetCore.Hosting.Diagnostics");
+        Logger = loggerFactory.CreateLogger("Microsoft.AspNetCore.Hosting.Diagnostics");  // <-----------------------hd1, dlr0
         LifetimeLogger = loggerFactory.CreateLogger("Microsoft.Hosting.Lifetime");
-        DiagnosticListener = diagnosticListener;
+        DiagnosticListener = diagnosticListener;   // <--------------dlr1.0
         ActivitySource = activitySource;
         Propagator = propagator;
         HttpContextFactory = httpContextFactory;
@@ -259,8 +264,8 @@ internal sealed partial class GenericWebHostService : IHostedService
       // build the request pipeline
       application = builder.Build();   // <--------------------------------------------- that's when all Middleware instances are created
 
-      var httpApplication = new HostingApplication(application, Logger, DiagnosticListener, ActivitySource, Propagator, HttpContextFactory);  // <-------------------t1
- 
+      var httpApplication = new HostingApplication(application, Logger, DiagnosticListener, ActivitySource, Propagator, HttpContextFactory);  // <-------------------t1, hd1.1.
+                                                                      // <---------------dlr1.1.
       await Server.StartAsync(httpApplication, cancellationToken);
 
       // ...
@@ -1130,7 +1135,7 @@ internal sealed class HostingApplication : IHttpApplication<HostingApplication.C
                               DistributedContextPropagator propagator, IHttpContextFactory httpContextFactory, HostingEventSource eventSource, HostingMetrics metrics)
     {
         _application = application;
-        _diagnostics = new HostingApplicationDiagnostics(logger, diagnosticSource, activitySource, propagator, eventSource, metrics);  // <--------------------------t2
+        _diagnostics = new HostingApplicationDiagnostics(logger, diagnosticSource, activitySource, propagator, eventSource, metrics);  // <--------------------t2, dlr2.0
         if (httpContextFactory is DefaultHttpContextFactory factory)
         {
             _defaultHttpContextFactory = factory;
@@ -1181,7 +1186,7 @@ internal sealed class HostingApplication : IHttpApplication<HostingApplication.C
             hostContext.HttpContext = httpContext;
         }
  
-        _diagnostics.BeginRequest(httpContext, hostContext);
+        _diagnostics.BeginRequest(httpContext, hostContext);  // <-------------dlr2.1.
         return hostContext;
     }
 
@@ -1273,7 +1278,8 @@ internal sealed class HostingApplication : IHttpApplication<HostingApplication.C
 //-------------------------------------------------V
 internal sealed class HostingApplicationDiagnostics
 {
-    internal const string ActivityName = "Microsoft.AspNetCore.Hosting.HttpRequestIn";  // <-----------that's why the first name of activity in asp.net is "HttpRequestIn"
+    internal const string ActivityName = "Microsoft.AspNetCore.Hosting.HttpRequestIn";  // <-----------this is the operation name of  first Activity being created
+                                                                                        // that's why the first name of activity in asp.net is "HttpRequestIn", dlr
     private const string ActivityStartKey = ActivityName + ".Start";
     private const string ActivityStopKey = ActivityName + ".Stop";
  
@@ -1301,7 +1307,7 @@ internal sealed class HostingApplicationDiagnostics
         _metrics = metrics;
     }
 
-    public void BeginRequest(HttpContext httpContext, HostingApplication.Context context)
+    public void BeginRequest(HttpContext httpContext, HostingApplication.Context context)   // <---------------dlr3.0
     {
         long startTimestamp = 0;
  
@@ -1336,7 +1342,7 @@ internal sealed class HostingApplicationDiagnostics
  
         if (loggingEnabled || diagnosticListenerActivityCreationEnabled || _activitySource.HasListeners())
         {
-            context.Activity = StartActivity(httpContext, loggingEnabled, diagnosticListenerActivityCreationEnabled, out var hasDiagnosticListener);
+            context.Activity = StartActivity(httpContext, loggingEnabled, diagnosticListenerActivityCreationEnabled, out var hasDiagnosticListener);  // <---------------dlr3.1
             context.HasDiagnosticListener = hasDiagnosticListener;
  
             if (context.Activity != null)
@@ -1347,23 +1353,20 @@ internal sealed class HostingApplicationDiagnostics
  
         if (diagnosticListenerEnabled)
         {
-            if (_diagnosticListener.IsEnabled(DeprecatedDiagnosticsBeginRequestKey))
+            if (_diagnosticListener.IsEnabled(DeprecatedDiagnosticsBeginRequestKey)) // <-------------- dlr4.0
             {
                 if (startTimestamp == 0)
                 {
                     startTimestamp = Stopwatch.GetTimestamp();
                 }
  
-                RecordBeginRequestDiagnostics(httpContext, startTimestamp);
+                RecordBeginRequestDiagnostics(httpContext, startTimestamp);  // <-----------------dlr4.0
             }
         }
  
         // To avoid allocation, return a null scope if the logger is not on at least to some degree.
         if (loggingEnabled)
         {
-            // Scope may be relevant for a different level of logging, so we always create it
-            // see: https://github.com/aspnet/Hosting/pull/944
-            // Scope can be null if logging is not on.
             context.Scope = Log.RequestScope(_logger, httpContext);
  
             if (_logger.IsEnabled(LogLevel.Information))
@@ -1373,14 +1376,27 @@ internal sealed class HostingApplicationDiagnostics
                     startTimestamp = Stopwatch.GetTimestamp();
                 }
  
-                // Non-inline
                 LogRequestStarting(context);
             }
         }
         context.StartTimestamp = startTimestamp;
     }
 
-    private Activity? StartActivity(HttpContext httpContext, bool loggingEnabled, bool diagnosticListenerActivityCreationEnabled, out bool hasDiagnosticListener)
+    private void LogRequestStarting(HostingApplication.Context context)
+    {
+        // IsEnabled is checked in the caller, so if we are here just log
+        var startLog = new HostingRequestStartingLog(context.HttpContext!);  // <---------------------rshm
+        context.StartLog = startLog;
+ 
+        _logger.Log(
+            logLevel: LogLevel.Information,
+            eventId: LoggerEventIds.RequestStarting,
+            state: startLog,   // <------------------------------rshm
+            exception: null,
+            formatter: HostingRequestStartingLog.Callback);
+    }
+
+    private Activity? StartActivity(HttpContext httpContext, bool loggingEnabled, bool diagnosticListenerActivityCreationEnabled, out bool hasDiagnosticListener)  //<-----dlr3.1
     {
         hasDiagnosticListener = false;
  
@@ -1400,16 +1416,13 @@ internal sealed class HostingApplicationDiagnostics
         {
             if (ActivityContext.TryParse(requestId, traceState, isRemote: true, out ActivityContext context))
             {
-                // The requestId used the W3C ID format. Unfortunately, the ActivitySource.CreateActivity overload that
-                // takes a string parentId never sets HasRemoteParent to true. We work around that by calling the
-                // ActivityContext overload instead which sets HasRemoteParent to parentContext.IsRemote.
-                // https://github.com/dotnet/aspnetcore/pull/41568#discussion_r868733305
-                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, context);
+                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, context);   // <---------------dlr3.2
+                                                       // ActivityName is "Microsoft.AspNetCore.Hosting.HttpRequestIn"
             }
             else
             {
                 // Pass in the ID we got from the headers if there was one.
-                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, string.IsNullOrEmpty(requestId) ? null! : requestId);
+                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, string.IsNullOrEmpty(requestId) ? null! : requestId);  
             }
         }
  
@@ -1458,16 +1471,24 @@ internal sealed class HostingApplicationDiagnostics
  
         _diagnosticListener.OnActivityImport(activity, httpContext);
  
-        if (_diagnosticListener.IsEnabled(ActivityStartKey))
+        if (_diagnosticListener.IsEnabled(ActivityStartKey))   // <---------------------------dlr3.3
         {
             hasDiagnosticListener = true;
-            StartActivity(activity, httpContext);
+            StartActivity(activity, httpContext);  // <---------------------------dlr3.3
         }
         else
         {
             activity.Start();
         }
  
+        return activity;
+    }
+
+    private Activity StartActivity(Activity activity, HttpContext httpContext)
+    {
+        activity.Start();
+        WriteDiagnosticEvent(_diagnosticListener, ActivityStartKey, httpContext);  // <---------------------------dlr3.4
+                                              // "Microsoft.AspNetCore.Hosting.HttpRequestIn.Start"
         return activity;
     }
 
@@ -1582,7 +1603,88 @@ internal sealed class HostingApplicationDiagnostics
             activity.Stop();
         }
     }
+
+    private void RecordBeginRequestDiagnostics(HttpContext httpContext, long startTimestamp)  // <-----------------------------dlr4.1.
+    {
+        WriteDiagnosticEvent(
+            _diagnosticListener,
+            DeprecatedDiagnosticsBeginRequestKey,  // "Microsoft.AspNetCore.Hosting.BeginRequest"
+            new DeprecatedRequestData(httpContext, startTimestamp));
+    }
+
+    private static void WriteDiagnosticEvent<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] TValue>(
+        DiagnosticSource diagnosticSource, string name, TValue value)
+    {
+        diagnosticSource.Write(name, value);  // <-----------------------------dlr3.5.
+    }
     // ...
 }
 //-------------------------------------------------Ʌ
+
+//---------------------------------------------V
+internal sealed class HostingRequestStartingLog : IReadOnlyList<KeyValuePair<string, object?>>  // HostingRequestFinishedLog is similar to this one
+{
+    private const string OriginalFormat = "Request starting {Protocol} {Method} {Scheme}://{Host}{PathBase}{Path}{QueryString} - {ContentType} {ContentLength}";
+    private const string EmptyEntry = "-";
+ 
+    internal static readonly Func<object, Exception?, string> Callback = (state, exception) => ((HostingRequestStartingLog)state).ToString();
+ 
+    private readonly HttpRequest _request;
+ 
+    private string? _cachedToString;
+ 
+    public int Count => 10;
+ 
+    public KeyValuePair<string, object?> this[int index] => index switch
+    {
+        0 => new KeyValuePair<string, object?>(nameof(_request.Protocol), _request.Protocol),
+        1 => new KeyValuePair<string, object?>(nameof(_request.Method), _request.Method),
+        2 => new KeyValuePair<string, object?>(nameof(_request.ContentType), _request.ContentType),
+        3 => new KeyValuePair<string, object?>(nameof(_request.ContentLength), _request.ContentLength),
+        4 => new KeyValuePair<string, object?>(nameof(_request.Scheme), _request.Scheme),
+        5 => new KeyValuePair<string, object?>(nameof(_request.Host), _request.Host.Value),
+        6 => new KeyValuePair<string, object?>(nameof(_request.PathBase), _request.PathBase.Value),
+        7 => new KeyValuePair<string, object?>(nameof(_request.Path), _request.Path.Value),
+        8 => new KeyValuePair<string, object?>(nameof(_request.QueryString), _request.QueryString.Value),
+        9 => new KeyValuePair<string, object?>("{OriginalFormat}", OriginalFormat),
+        _ => throw new ArgumentOutOfRangeException(nameof(index)),
+    };
+ 
+    public HostingRequestStartingLog(HttpContext httpContext)
+    {
+        _request = httpContext.Request;
+    }
+ 
+    public override string ToString()
+    {
+        if (_cachedToString == null)
+        {
+            var request = _request;
+            _cachedToString = $"Request starting {request.Protocol} {request.Method} {request.Scheme}://{request.Host.Value}{request.PathBase.Value}{request.Path.Value}{request.QueryString.Value} - {EscapedValueOrEmptyMarker(request.ContentType)} {ValueOrEmptyMarker(request.ContentLength)}";   // <------------rshm
+        }
+ 
+        return _cachedToString;
+    }
+ 
+    public IEnumerator<KeyValuePair<string, object?>> GetEnumerator()
+    {
+        for (var i = 0; i < Count; i++)
+        {
+            yield return this[i];
+        }
+    }
+ 
+    IEnumerator IEnumerable.GetEnumerator()
+    {
+        return GetEnumerator();
+    }
+ 
+    internal static string EscapedValueOrEmptyMarker(string? potentialValue)
+        // Encode space as +
+        => potentialValue?.Length > 0 ? potentialValue.Replace(' ', '+') : EmptyEntry;
+ 
+    internal static string ValueOrEmptyMarker<T>(T? potentialValue) where T : struct, IFormattable
+        => potentialValue?.ToString(null, CultureInfo.InvariantCulture) ?? EmptyEntry;
+}
+//---------------------------------------------Ʌ
 ```
