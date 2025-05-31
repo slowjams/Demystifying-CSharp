@@ -204,7 +204,7 @@ internal sealed class GenericWebHostBuilder : IWebHostBuilder, ISupportsStartup,
     }
 
     // this method is important
-    private void UseStartup([DynamicallyAccessedMembers(StartupLinkerOptions.Accessibility)] Type startupType, HostBuilderContext context, IServiceCollection services)
+    private void UseStartup(Type startupType, HostBuilderContext context, IServiceCollection services)
     {
        // ...
        instance ??= ActivatorUtilities.CreateInstance(new HostServiceProvider(webHostBuilderContext), startupType);
@@ -1200,7 +1200,7 @@ internal sealed class HostingApplication : IHttpApplication<HostingApplication.C
     public void DisposeContext(Context context, Exception? exception)
     {
         var httpContext = context.HttpContext!;
-        _diagnostics.RequestEnd(httpContext, exception, context);
+        _diagnostics.RequestEnd(httpContext, exception, context);  // <----------------------------
  
         if (_defaultHttpContextFactory != null)
         {
@@ -1414,10 +1414,13 @@ internal sealed class HostingApplicationDiagnostics
         Activity? activity = null;
         if (_activitySource.HasListeners())
         {
-            if (ActivityContext.TryParse(requestId, traceState, isRemote: true, out ActivityContext context))
+            if (ActivityContext.TryParse(requestId, traceState, isRemote: true, out ActivityContext context)) // <---------------dlr3.2.0
             {
-                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, context);   // <---------------dlr3.2
+                // <------------dlrspecial, ActivityContext will only be used under. HostingApplicationDiagnostics
+                // other usage such as using (Activity parentActivity = ActivitySource.StartActivity("xxx")) will not involve ActivityContext , check dlrspecial in ConsoleAppTracing
+                activity = _activitySource.CreateActivity(ActivityName, ActivityKind.Server, context);   // <---------------dlr3.2.4.
                                                        // ActivityName is "Microsoft.AspNetCore.Hosting.HttpRequestIn"
+                // note, this souce code is quite old, I think the original ActivitySource.CreateActivity() doesn't start activity by default
             }
             else
             {
@@ -1484,15 +1487,18 @@ internal sealed class HostingApplicationDiagnostics
         return activity;
     }
 
-    private Activity StartActivity(Activity activity, HttpContext httpContext)
+    private Activity StartActivity(Activity activity, HttpContext httpContext)  // <---------------procenrih
     {
-        activity.Start();
+        activity.Start();  // <-----------activity is started then calls TracerProviderSdk.listener.ActivityStarted, which sends activity to process by processor?.OnStart(activity)
+                           // which means that when processor receives the activity, it hasn't been enriched yet, because EnrichWithHttpRequest only occurs after WriteDiagnosticEvent
+                           // is called which calls HttpInListener.OnStartActivity, that's when EnrichWithHttpRequest is invoked
+                           // so only when activity.Stop() is called, processor.OnEnd(activity) so the enriched activity can be "seen" by the process.OnEnd
         WriteDiagnosticEvent(_diagnosticListener, ActivityStartKey, httpContext);  // <---------------------------dlr3.4
                                               // "Microsoft.AspNetCore.Hosting.HttpRequestIn.Start"
         return activity;
     }
 
-    public void RequestEnd(HttpContext httpContext, Exception? exception, HostingApplication.Context context)
+    public void RequestEnd(HttpContext httpContext, Exception? exception, HostingApplication.Context context)  // <--------------------------
     {
         // Local cache items resolved multiple items, in order of use so they are primed in cpu pipeline when used
         var startTimestamp = context.StartTimestamp;
@@ -1551,7 +1557,7 @@ internal sealed class HostingApplicationDiagnostics
                 {
                     // Diagnostics is enabled for EndRequest, but it may not be for BeginRequest
                     // so call GetTimestamp if currentTimestamp is zero (from above)
-                    RecordEndRequestDiagnostics(httpContext, currentTimestamp);
+                    RecordEndRequestDiagnostics(httpContext, currentTimestamp);  // <----------------------------------
                 }
             }
             else
@@ -1570,7 +1576,7 @@ internal sealed class HostingApplicationDiagnostics
         // Always stop activity if it was started
         if (activity is not null)
         {
-            StopActivity(httpContext, activity, context.HasDiagnosticListener);
+            StopActivity(httpContext, activity, context.HasDiagnosticListener);  // <-----------------------
         }
  
         if (context.EventLogEnabled)
@@ -1590,6 +1596,20 @@ internal sealed class HostingApplicationDiagnostics
  
         // Logging Scope is finshed with
         context.Scope?.Dispose();
+    }
+
+    private void RecordEndRequestDiagnostics(HttpContext httpContext, long currentTimestamp)
+    {
+        WriteDiagnosticEvent(
+            _diagnosticListener,
+            DeprecatedDiagnosticsEndRequestKey,
+            new DeprecatedRequestData(httpContext, currentTimestamp));
+    }
+
+    private static void WriteDiagnosticEvent<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties)] TValue>(
+        DiagnosticSource diagnosticSource, string name, TValue value)
+    {
+        diagnosticSource.Write(name, value);
     }
 
     private void StopActivity(HttpContext httpContext, Activity activity, bool hasDiagnosticListener)
